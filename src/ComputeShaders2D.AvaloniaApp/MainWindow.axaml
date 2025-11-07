@@ -1,0 +1,132 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:controls="clr-namespace:ComputeShaders2D.AvaloniaApp.Controls"
+        xmlns:vm="clr-namespace:ComputeShaders2D.AvaloniaApp.ViewModels"
+        mc:Ignorable="d" d:DesignWidth="1200" d:DesignHeight="720"
+        x:Class="ComputeShaders2D.AvaloniaApp.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="ComputeShaders2D Renderer">
+    <Grid ColumnDefinitions="360,*" Background="#101425" Margin="0">
+        <ScrollViewer Background="#12162b" Padding="16" VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="12">
+                <TextBlock Text="Scene controls" FontWeight="Bold"/>
+
+                <StackPanel>
+                    <TextBlock Text="Renderer" />
+                    <ComboBox ItemsSource="{Binding RendererModes}"
+                              SelectedItem="{Binding RendererMode}"
+                              Margin="0,4,0,0"/>
+                </StackPanel>
+
+                <StackPanel>
+                    <TextBlock Text="Canvas Size" />
+                    <ComboBox ItemsSource="{Binding CanvasSizes}"
+                              SelectedItem="{Binding SelectedCanvas}"
+                              Margin="0,4,0,0"/>
+                </StackPanel>
+
+                <StackPanel>
+                    <TextBlock Text="Tile Size (px)" />
+                    <Slider Minimum="16" Maximum="128" TickFrequency="16" Value="{Binding TileSize}" />
+                    <TextBlock Text="{Binding TileSize}" FontFamily="Consolas" FontSize="12"/>
+                </StackPanel>
+
+                <StackPanel>
+                    <TextBlock Text="AA (supersample)" />
+                    <ComboBox ItemsSource="{Binding SupersampleOptions}"
+                              SelectedItem="{Binding Supersample}"/>
+                </StackPanel>
+
+                <StackPanel>
+                    <TextBlock Text="Stroke Width" />
+                    <Slider Minimum="1" Maximum="40" Value="{Binding StrokeWidth}"/>
+                    <TextBlock Text="{Binding StrokeWidth}" FontFamily="Consolas" FontSize="12"/>
+                </StackPanel>
+
+                <StackPanel>
+                    <TextBlock Text="Join" />
+                    <ComboBox ItemsSource="{Binding StrokeJoinValues}"
+                              SelectedItem="{Binding StrokeJoin}"/>
+                </StackPanel>
+
+                <StackPanel>
+                    <TextBlock Text="Cap" />
+                    <ComboBox ItemsSource="{Binding StrokeCapValues}"
+                              SelectedItem="{Binding StrokeCap}"/>
+                </StackPanel>
+
+                <StackPanel>
+                    <TextBlock Text="Miter Limit" />
+                    <Slider Minimum="1" Maximum="10" Value="{Binding MiterLimit}" />
+                    <TextBlock Text="{Binding MiterLimit}" FontFamily="Consolas" FontSize="12"/>
+                </StackPanel>
+
+                <TextBlock Text="Typography &amp; SVG" FontWeight="Bold" Margin="0,8,0,0"/>
+                <CheckBox Content="Use system font" IsChecked="{Binding UseSystemFont}" />
+                <TextBox Text="{Binding FontFamily}" IsEnabled="{Binding UseSystemFont}" Margin="0,4,0,0"
+                         Watermark="Font family (e.g., Segoe UI)" />
+                <CheckBox Content="Show SVG overlay" IsChecked="{Binding ShowSvgOverlay}" />
+
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Content="Render" Command="{Binding RenderCommand}" />
+                    <Button Content="Randomize" Command="{Binding RandomizeCommand}" />
+                    <Button Content="{Binding FillRuleLabel}" Command="{Binding ToggleFillRuleCommand}" />
+                </StackPanel>
+
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Content="{Binding PlayPauseLabel}" Command="{Binding PlayPauseCommand}" />
+                    <Button Content="Reset Time" Command="{Binding ResetTimeCommand}" />
+                </StackPanel>
+
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Content="Default" Command="{Binding LoadDefaultCommand}" />
+                    <Button Content="Animation" Command="{Binding LoadAnimationCommand}" />
+                    <Button Content="Clip" Command="{Binding LoadClipCommand}" />
+                    <Button Content="Mask" Command="{Binding LoadMaskCommand}" />
+                </StackPanel>
+
+                <TextBlock Text="Stats" FontWeight="Bold" Margin="0,8,0,0"/>
+                <UniformGrid Columns="3" Rows="2" Margin="0,4,0,0">
+                    <StackPanel>
+                        <TextBlock Text="Build" FontSize="12" />
+                        <TextBlock Text="{Binding Stats.BuildMs, StringFormat='{}{0:0.00} ms'}" FontFamily="Consolas" />
+                    </StackPanel>
+                    <StackPanel>
+                        <TextBlock Text="Raster" FontSize="12" />
+                        <TextBlock Text="{Binding Stats.RasterMs, StringFormat='{}{0:0.00} ms'}" FontFamily="Consolas" />
+                    </StackPanel>
+                    <StackPanel>
+                        <TextBlock Text="Tiles" FontSize="12" />
+                        <TextBlock Text="{Binding Stats.TilesText}" FontFamily="Consolas" />
+                    </StackPanel>
+                    <StackPanel>
+                        <TextBlock Text="FPS" FontSize="12" />
+                        <TextBlock Text="{Binding Stats.Fps, StringFormat='{}{0:0.0}'}" FontFamily="Consolas" />
+                    </StackPanel>
+                    <StackPanel>
+                        <TextBlock Text="Frame" FontSize="12" />
+                        <TextBlock Text="{Binding Stats.FrameMs, StringFormat='{}{0:0.00} ms'}" FontFamily="Consolas" />
+                    </StackPanel>
+                    <StackPanel>
+                        <TextBlock Text="Mode" FontSize="12" />
+                        <TextBlock Text="{Binding Stats.ModeText}" FontFamily="Consolas" />
+                    </StackPanel>
+                </UniformGrid>
+
+                <TextBlock Text="Path Builder Playground" FontWeight="Bold" Margin="0,8,0,0"/>
+                <TextBox Text="{Binding ScriptText}" AcceptsReturn="True" Height="300" FontFamily="Consolas" Background="#0b0e1d" Foreground="#cfe1ff"/>
+                <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+                    <Button Content="Run Script" Command="{Binding RunScriptCommand}"/>
+                    <Button Content="Stop Script" Command="{Binding StopScriptCommand}" IsEnabled="{Binding IsScriptActive}"/>
+                </StackPanel>
+                <TextBlock Text="{Binding ScriptStatus}" FontSize="12" Foreground="#cfe1ff" Margin="0,2,0,0"/>
+            </StackPanel>
+        </ScrollViewer>
+
+        <Border Grid.Column="1" Margin="16" Background="#0f1220" CornerRadius="12">
+            <controls:GpuCanvas SceneController="{Binding SceneController}"/>
+        </Border>
+    </Grid>
+</Window>

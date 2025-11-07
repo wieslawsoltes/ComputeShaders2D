@@ -1,0 +1,2925 @@
+Skip to content
+Chat history
+
+You said:
+Can we do same compute shader rendering using .NET / C# and some GPU friendly library and integrate into Avalonia ?
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prefix‑Sum CPU + WebGPU Vector Renderer — Clipping + Opacity Masking (fixed zero-size bindings)</title>
+  <style>
+    :root { --bg:#0f1220; --panel:#12162b; --ink:#e7e9ef; --line:#232849; }
+    html,body { height:100%; margin:0; background:var(--bg); color:var(--ink);
+      font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,sans-serif; }
+    header { padding:12px 16px; background:#151934; position:sticky; top:0; z-index:5;
+      box-shadow:0 2px 8px rgba(0,0,0,.25); }
+    header h1 { margin:0; font-size:16px; font-weight:600; }
+    .row { display:grid; grid-template-columns:360px 1fr; gap:16px; padding:16px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; position:relative; }
+    label { display:flex; align-items:center; gap:8px; margin:6px 0; }
+    input[type="range"] { width:100%; }
+    select, button { background:#2a3160; color:#fff; border:1px solid #3b4282;
+      border-radius:10px; padding:6px 8px; }
+    button { cursor:pointer; }
+    button:hover { filter:brightness(1.06); }
+    .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    .small { font-size:12px; opacity:.9; }
+    canvas { background:#0b0e1d; border:1px solid var(--line); border-radius:12px; width:100%; height:auto; image-rendering:pixelated; }
+    .row2 { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:8px; }
+    .stat { background:#0e1330; border:1px dashed #2e3569; border-radius:10px; padding:8px; text-align:center; }
+    dialog { border:1px solid #3b4282; border-radius:10px; background:#0b0e1d; color:#e7e9ef; max-width:920px; }
+    dialog::backdrop{ background: rgba(0,0,0,.45); }
+  </style>
+</head>
+<body>
+  <header><h1>Prefix‑Sum CPU + WebGPU Vector Renderer → AA + Joins/Caps + Text + SVG + Animation + <b>Clipping & Opacity Masking</b></h1></header>
+
+  <div class="row">
+    <div class="panel">
+      <div><strong>Scene controls</strong></div>
+
+      <label>Renderer
+        <select id="renderer">
+          <option value="auto" selected>Auto (WebGPU if available)</option>
+          <option value="webgpu">WebGPU</option>
+          <option value="cpu">CPU (Workers)</option>
+        </select>
+      </label>
+
+      <label>Canvas Size
+        <select id="size">
+          <option value="800x600">800 × 600</option>
+          <option value="1024x768">1024 × 768</option>
+          <option value="1280x720">1280 × 720</option>
+          <option value="1920x1080">1920 × 1080</option>
+        </select>
+      </label>
+
+      <label>Tile Size (px)
+        <input id="tile" type="range" min="16" max="128" value="64" step="16" />
+        <span id="tileVal" class="mono small">64</span>
+      </label>
+
+      <label>Workers (CPU)
+        <input id="workers" type="range" min="1" max="16" value="4" />
+        <span id="workersVal" class="mono small">4</span>
+      </label>
+
+      <label>Stroke Width
+        <input id="stroke" type="range" min="1" max="40" value="10" />
+        <span id="strokeVal" class="mono small">10</span>
+      </label>
+
+      <label>Join
+        <select id="join">
+          <option value="round" selected>round</option>
+          <option value="bevel">bevel</option>
+          <option value="miter">miter</option>
+        </select>
+      </label>
+
+      <label>Cap
+        <select id="cap">
+          <option value="round" selected>round</option>
+          <option value="butt">butt</option>
+          <option value="square">square</option>
+        </select>
+      </label>
+
+      <label>Miter Limit
+        <input id="miter" type="range" min="1" max="10" step="0.25" value="4" />
+        <span id="miterVal" class="mono small">4</span>
+      </label>
+
+      <label>AA (supersample)
+        <select id="aa">
+          <option value="1">1× (off)</option>
+          <option value="2" selected>2×</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+
+      <div class="row2">
+        <button id="rerender">Render</button>
+        <button id="randomize">Randomize Lines</button>
+        <button id="toggleRule">Fill Rule: <span id="ruleTxt">evenodd</span></button>
+      </div>
+
+      <div class="row2" style="margin-top:8px;">
+        <button id="play">▶ Play</button>
+        <button id="resetTime">⟲ Reset Time</button>
+        <button id="loadAnim">Load Animation Sample</button>
+      </div>
+
+      <div class="row2" style="margin-top:8px;">
+        <button id="loadClipSample">Load <b>Clip</b> Sample</button>
+        <button id="loadMaskSample">Load <b>Opacity Mask</b> Sample</button>
+        <button id="helpBtn">API Help</button>
+      </div>
+
+      <p class="small" style="margin-top:6px">
+        CPU: per‑tile span fills (workers) + per‑sample tests when clip/mask is active. WebGPU: per‑pixel compute over per‑tile shape lists, SSAA in shader, then full‑screen blit.<br/>
+        Strokes: <strong>round/bevel/miter</strong> joins and <strong>round/butt/square</strong> caps.<br/>
+        <b>Clipping</b> is the intersection of active clip paths. <b>Opacity masks</b> are union alpha masks applied multiplicatively. FPS and frame‑time update live.
+      </p>
+
+      <div class="row2">
+        <div class="stat"><div class="small">Build</div><div class="mono" id="tBuild">–</div></div>
+        <div class="stat"><div class="small">Raster</div><div class="mono" id="tRaster">–</div></div>
+        <div class="stat"><div class="small">Tiles</div><div class="mono" id="tTiles">–</div></div>
+      </div>
+      <div class="row2" style="margin-top:8px;">
+        <div class="stat"><div class="small">FPS</div><div class="mono" id="fps">–</div></div>
+        <div class="stat"><div class="small">Frame</div><div class="mono" id="tFrame">–</div></div>
+        <div class="stat"><div class="small">Mode</div><div class="mono" id="modeTxt">Static</div></div>
+      </div>
+
+      <div style="margin-top:12px">
+        <strong>Path Builder Playground</strong>
+        <textarea id="code" class="mono" style="width:100%; height:520px; background:#0b0e1d; color:#cfe1ff; border:1px solid #2e3569; border-radius:8px; padding:8px;">
+// Default static playground. New API: pushClip()/popClip(), withClip(), pushOpacity()/popOpacity(),
+// pushOpacityMask()/popOpacityMask(), withOpacityMask(). Mask shapes can provide per-shape alpha.
+const W = api.width(), H = api.height();
+const yellow = api.color(250,245,140,255);
+const sky    = api.color( 88,156,255,220);
+const coral  = api.color(255,120, 88,190);
+const white  = api.color(235,240,250,255);
+
+// Load font (memoized)
+const FONT_URL = 'https://raw.githubusercontent.com/IBM/plex/master/IBM-Plex-Sans/fonts/complete/ttf/IBM-Plex-Sans-Regular.ttf';
+if (!globalThis.__plex) globalThis.__plex = await api.loadFont(FONT_URL);
+const font = globalThis.__plex;
+
+// 1) Filled star
+api.fillPath(
+  api.path().poly(api.star(W*0.5, H*0.35, Math.min(W,H)*0.26, Math.min(W,H)*0.11, 7)).closePath(),
+  sky, api.rule()
+);
+
+// 2) Blobby polygon
+const blob = api.path()
+  .ellipse(W*0.26, H*0.68, Math.min(W,H)*0.12, Math.min(W,H)*0.08, 0)
+  .transform({scaleX:1.06, scaleY:1.0, rotate:0.08})
+  .closePath();
+api.fillPath(blob, coral, api.rule());
+
+// 3) Random polyline stroke (UI join/cap/miter)
+api.strokePath(
+  api.path().poly(api.randomPolyline(220)),
+  api.param('strokeWidth'),
+  yellow,
+  { join: api.param('join'), cap: api.param('cap'), miterLimit: api.param('miterLimit') }
+);
+
+// 4) Curves
+const p = api.path().moveTo(W*0.12, H*0.15)
+  .bezierTo(W*0.28,H*0.06, W*0.42,H*0.28, W*0.52,H*0.15)
+  .quadTo  (W*0.64,H*0.03, W*0.78,H*0.16);
+api.strokePath(p, 8, api.color(160,220,255,255), { join:'round', cap:'round' });
+
+// 5) Text
+api.fillText  (font, "Clipping + Opacity Masking", W*0.5, H*0.86, 36, white, { align:'center' });
+api.strokeText(font, "Try the new samples ↑", W*0.5, H*0.92, 26, 3, yellow, { align:'center', join:'miter', cap:'butt' });
+        </textarea>
+
+        <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+          <button id="run">Run Code</button>
+          <button id="reset">Reset to Example</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <!-- CPU canvas -->
+      <canvas id="cv" width="800" height="600"></canvas>
+      <!-- WebGPU canvas -->
+      <canvas id="cvgpu" width="800" height="600" style="display:none"></canvas>
+    </div>
+  </div>
+
+  <dialog id="helpDlg">
+    <h3>Path Builder API</h3>
+    <pre class="mono" style="white-space:pre-wrap; line-height:1.25">
+// Paths (multi‑subpath, path‑level transform)
+api.path()
+  .moveTo(x, y) .lineTo(x, y)
+  .quadTo(cpx, cpy, x, y)
+  .bezierTo(c1x, c1y, c2x, c2y, x, y)
+  .arc(cx, cy, r, a0, a1, ccw?) .rect(x, y, w, h, rx?)
+  .ellipse(cx, cy, rx, ry, rot=0)
+  .poly([[x,y], ...])
+  .transform({translateX,translateY,scaleX,scaleY,rotate})
+  .closePath();
+
+// Fill / Stroke
+api.fillPath(path, rgba, rule?)
+api.strokePath(path, width, rgba, { join:'round|bevel|miter', cap:'round|butt|square', miterLimit:4 })
+
+// Text (opentype.js; fallback stroke font)
+const font = await api.loadFont('*.ttf');
+api.fillText(font, "Hello", x, y, size, rgba, { align:'left|center|right' });
+api.strokeText(font, "World", x, y, size, width, rgba, { join, cap, miterLimit });
+
+// SVG
+const p = api.svgPath("M10 10 h 80 v 80 h -80 Z");
+api.fillPath(p, rgba, api.rule());
+api.strokePath(p, width, rgba, { join, cap, miterLimit });
+
+// Helpers
+api.star(cx,cy,rOuter,rInner,n)
+api.randomPolyline(n)
+api.color(r,g,b,a)
+api.rule(), api.width(), api.height(), api.param(...)
+
+// Animation
+api.time(), api.dt(), api.frame()
+
+// NEW — Clipping & Opacity
+// Clipping is an intersection of all active clip paths (fill rule respected).
+api.pushClip(pathOrSvgPath, rule?)      // push a clip path
+api.popClip()                           // pop last clip
+await api.withClip(pathOrSvg, rule?, async () => { /* draw clipped content */ })
+
+// Opacity control stack
+api.pushOpacity(alpha)                  // multiply opacity of subsequent shapes
+api.popOpacity()
+
+// Opacity masks (union of mask shapes' alpha, applied multiplicatively)
+api.pushOpacityMask(pathOrSvg, alpha=1, rule?)   // push a mask path with constant alpha
+api.popOpacityMask()
+await api.withOpacityMask(pathOrSvg, alpha, rule, async () => { /* draw */ })
+    </pre>
+    <div style="text-align:right; margin-top:8px;"><button id="helpClose">Close</button></div>
+  </dialog>
+
+<script>
+(function(){
+  // ===============================
+  // DOM & controls
+  // ===============================
+  const cvCPU = document.getElementById('cv');
+  const ctx2D = cvCPU.getContext('2d');
+  const cvGPU = document.getElementById('cvgpu');
+  let gpuCtx = null, gpuDevice = null, gpuAdapter = null, gpuFormat = null;
+  let gpuPipelines = null, gpuResources = null;
+
+  const rendererSel = document.getElementById('renderer');
+  const sizeSel = document.getElementById('size');
+  const tileInp = document.getElementById('tile'); const tileVal = document.getElementById('tileVal');
+  const workersInp = document.getElementById('workers'); const workersVal = document.getElementById('workersVal');
+  const strokeInp = document.getElementById('stroke'); const strokeVal = document.getElementById('strokeVal');
+  const joinSel = document.getElementById('join');
+  const capSel = document.getElementById('cap');
+  const miterInp = document.getElementById('miter'); const miterVal = document.getElementById('miterVal');
+  const aaSel = document.getElementById('aa');
+  const btnRender = document.getElementById('rerender');
+  const btnRandom = document.getElementById('randomize');
+  const btnRule = document.getElementById('toggleRule'); const ruleTxt = document.getElementById('ruleTxt');
+  const tBuild = document.getElementById('tBuild'); const tRaster = document.getElementById('tRaster'); const tTiles = document.getElementById('tTiles');
+  const fpsEl = document.getElementById('fps'); const tFrameEl = document.getElementById('tFrame'); const modeTxt = document.getElementById('modeTxt');
+  const codeEl = document.getElementById('code');
+  const btnRun = document.getElementById('run');
+  const btnReset = document.getElementById('reset');
+  const helpBtn = document.getElementById('helpBtn');
+  const helpDlg = document.getElementById('helpDlg');
+  const helpClose = document.getElementById('helpClose');
+  const btnPlay = document.getElementById('play');
+  const btnResetTime = document.getElementById('resetTime');
+  const btnLoadAnim = document.getElementById('loadAnim');
+  const btnLoadClipSample = document.getElementById('loadClipSample');
+  const btnLoadMaskSample = document.getElementById('loadMaskSample');
+
+  const HW = Math.max(1, Math.min(16, (navigator.hardwareConcurrency||4)));
+  workersInp.max = String(HW); workersInp.value = String(Math.min(4, HW));
+  workersVal.textContent = workersInp.value;
+
+  tileInp.addEventListener('input', () => tileVal.textContent = tileInp.value);
+  workersInp.addEventListener('input', () => workersVal.textContent = workersInp.value);
+  strokeInp.addEventListener('input', () => strokeVal.textContent = strokeInp.value);
+  miterInp.addEventListener('input', () => miterVal.textContent = miterInp.value);
+
+  let fillRule = 'evenodd';
+  btnRule.addEventListener('click', () => { fillRule = (fillRule==='evenodd')?'nonzero':'evenodd'; ruleTxt.textContent = fillRule; });
+
+  sizeSel.addEventListener('change', async () => {
+    const [w,h]=sizeSel.value.split('x').map(Number);
+    setCanvasSize(w,h);
+    selectCanvasForRenderer();
+    await draw();
+  });
+  rendererSel.addEventListener('change', async () => {
+    selectCanvasForRenderer();
+    await draw();
+  });
+
+  btnRender.addEventListener('click', draw);
+  btnRandom.addEventListener('click', () => { randomizeLines(true); draw(); });
+  btnRun.addEventListener('click', draw);
+  btnReset.addEventListener('click', () => { location.reload(); });
+
+  helpBtn.addEventListener('click', () => { if (typeof helpDlg.showModal==='function') helpDlg.showModal(); else alert('Dialog unsupported. See the API snippet.'); });
+  helpClose.addEventListener('click', () => helpDlg.close());
+
+  // Animation controls
+  let isAnimating = false;
+  const anim = { t:0, dt:0, frame:0, last:0, t0:0, raf:0, fpsEMA:0, lastFrameEnd:0 };
+  function playPause(){
+    isAnimating = !isAnimating;
+    modeTxt.textContent = isAnimating ? 'Animating' : 'Static';
+    btnPlay.textContent = isAnimating ? '⏸ Pause' : '▶ Play';
+    if (isAnimating){
+      const now = performance.now();
+      if (anim.t0 === 0) anim.t0 = now;
+      anim.last = now; anim.lastFrameEnd = now;
+      anim.raf = requestAnimationFrame(loop);
+    } else {
+      cancelAnimationFrame(anim.raf);
+    }
+  }
+  function resetTime(){
+    anim.t = 0; anim.dt = 0; anim.frame=0;
+    const now = performance.now();
+    anim.t0 = now; anim.last = now; anim.lastFrameEnd = now;
+    fpsEl.textContent = '–'; tFrameEl.textContent = '–';
+  }
+  async function loop(ts){
+    const dt = Math.max(0, ts - anim.last);
+    anim.last = ts;
+    anim.dt = dt/1000;
+    anim.t = (ts - anim.t0)/1000;
+    anim.frame++;
+    const instFPS = dt>0 ? 1000/dt : 0;
+    anim.fpsEMA = anim.fpsEMA ? (anim.fpsEMA*0.9 + instFPS*0.1) : instFPS;
+    await draw();
+    const now = performance.now();
+    const frameDur = now - anim.lastFrameEnd;
+    anim.lastFrameEnd = now;
+    tFrameEl.textContent = frameDur.toFixed(2) + ' ms';
+    fpsEl.textContent = (anim.fpsEMA||0).toFixed(1);
+    if (isAnimating) anim.raf = requestAnimationFrame(loop);
+  }
+  btnPlay.addEventListener('click', playPause);
+  btnResetTime.addEventListener('click', resetTime);
+
+  // New sample loaders
+  const CLIP_SAMPLE = 
+const W = api.width(), H = api.height();
+const t = api.time();
+const k = Math.min(W,H);
+const cyan  = api.color(120,220,255,210);
+const gold  = api.color(252,212, 98,230);
+const pink  = api.color(255,120,180,220);
+const white = api.color(235,240,250,255);
+
+// Build a large rounded-rect clip that drifts and rotates.
+const clipPath = api.path()
+  .rect(W*0.18, H*0.14, W*0.64, H*0.64, 24)
+  .transform({ rotate: 0.12*Math.sin(t*0.8), translateX: 0, translateY: 0 })
+  .closePath();
+
+// Draw everything inside the clip only:
+await api.withClip(clipPath, api.rule(), async () => {
+  // Rotating star field
+  for (let i=0;i<6;i++){
+    const a = t*0.5 + i*0.4;
+    const R0 = 0.26*k*(0.65 + 0.35*Math.sin(t*0.9 + i));
+    const R1 = 0.11*k*(0.65 + 0.35*Math.cos(t*0.7 + i));
+    const cx = W*0.5 + Math.cos(a)*k*0.08;
+    const cy = H*0.42 + Math.sin(a*1.1)*k*0.06;
+    const star = api.path().poly(api.star(0,0, R0, R1, 7)).transform({ rotate: a, translateX: cx, translateY: cy }).closePath();
+    api.fillPath(star, (i%2?cyan:pink), 'evenodd');
+  }
+
+  // Thick lissajous ribbon, inherits clip
+  const A = 0.34*k, B = 0.18*k, nPts = 300;
+  const p = api.path();
+  for (let i=0;i<=nPts;i++){
+    const u = i/nPts;
+    const x = W*0.5 + Math.sin( t*0.4 + u*6.283*2 )*A;
+    const y = H*0.68 + Math.sin( t*0.7 + u*6.283*3 )*B;
+    (i===0)? p.moveTo(x,y) : p.lineTo(x,y);
+  }
+  api.strokePath(p, 14, gold, { join:'round', cap:'round' });
+
+  // Label
+  const font = globalThis.__plex || (globalThis.__plex = await api.loadFont('https://raw.githubusercontent.com/IBM/plex/master/IBM-Plex-Sans/fonts/complete/ttf/IBM-Plex-Sans-Regular.ttf'));
+  api.fillText(font, "withClip(…)", W*0.5, H*0.9, 40, white, { align:'center' });
+});;
+
+  const MASK_SAMPLE = 
+const W = api.width(), H = api.height();
+const t = api.time();
+const k = Math.min(W,H);
+const yellow = api.color(250,245,140,255);
+const blue   = api.color(100,160,255,220);
+const green  = api.color(120,220,150,220);
+const white  = api.color(235,240,250,255);
+
+// Build a text-shaped opacity mask (soft alpha = 0.85)
+const font = globalThis.__plex || (globalThis.__plex = await api.loadFont('https://raw.githubusercontent.com/IBM/plex/master/IBM-Plex-Sans/fonts/complete/ttf/IBM-Plex-Sans-Regular.ttf'));
+const textPath = api.textPath(font, "MASK", W*0.5, H*0.55, 160, { align:'center' });
+
+// Use mask for all content inside the scope
+await api.withOpacityMask(textPath, 0.85, api.rule(), async () => {
+  // Animated discs behind text; masked by the letters
+  for (let i=0;i<18;i++){
+    const a = t*0.6 + i*(2*Math.PI/18);
+    const r = 20 + 12*Math.sin(t*1.3 + i);
+    const cx = W*0.5 + Math.cos(a)*k*0.28;
+    const cy = H*0.55 + Math.sin(a*1.1)*k*0.18;
+    api.fillPath(api.path().ellipse(cx,cy,r,r,0,36).closePath(), (i%2?blue:green), api.rule());
+  }
+
+  // Extra opacity stack for inner content
+  api.pushOpacity(0.6);
+  const p = api.path();
+  const n = 320, A = 0.22*k, B = 0.12*k;
+  for (let i=0;i<=n;i++){
+    const u = i/n;
+    const x = W*0.5 + Math.sin( t*0.8 + u*6.283*3 )*A;
+    const y = H*0.55 + Math.sin( t*1.2 + u*6.283*4 )*B;
+    (i===0)? p.moveTo(x,y) : p.lineTo(x,y);
+  }
+  api.strokePath(p, 10, yellow, { join:'round', cap:'round' });
+  api.popOpacity();
+});
+
+// Caption (outside mask)
+api.fillText(font, "withOpacityMask(… , α=0.85)", W*0.5, H*0.92, 32, white, { align:'center' });;
+
+  btnLoadAnim.addEventListener('click', () => {
+    const ANIM = 
+const W = api.width(), H = api.height();
+const t = api.time();
+const k = Math.min(W,H);
+const yellow = api.color(250,245,140,255);
+const sky    = api.color( 88,156,255,220);
+const white  = api.color(235,240,250,255);
+const FONT_URL = 'https://raw.githubusercontent.com/IBM/plex/master/IBM-Plex-Sans/fonts/complete/ttf/IBM-Plex-Sans-Regular.ttf';
+if (!globalThis.__plex) globalThis.__plex = await api.loadFont(FONT_URL);
+const font = globalThis.__plex;
+
+const R0 = 0.26*k*(1.0 + 0.06*Math.sin(t*1.2));
+const R1 = 0.11*k;
+const star = api.path().poly(api.star(0,0, R0, R1, 7)).transform({ rotate: t*0.9, translateX: W*0.5, translateY: H*0.38 }).closePath();
+api.fillPath(star, sky, api.rule());
+const A = 0.32*k, B = 0.18*k, nPts = 340;
+const p = api.path();
+for (let i=0;i<=nPts;i++){
+  const u = i/nPts;
+  const x = W*0.5 + Math.sin( (t*0.8) + u*6.283*2 )*A;
+  const y = H*0.70 + Math.sin( (t*1.1) + u*6.283*3 )*B;
+  (i===0) ? p.moveTo(x,y) : p.lineTo(x,y);
+}
+api.strokePath(p, 6 + 5*Math.sin(t*1.7), yellow, { join: api.param('join'), cap: api.param('cap'), miterLimit: api.param('miterLimit') });
+api.fillText(font, "Animated Paths • CPU + WebGPU", W*0.5, H*0.90, 40, white, { align:'center' });
+;
+    codeEl.value = ANIM.trim(); draw();
+  });
+  btnLoadClipSample.addEventListener('click', () => { codeEl.value = CLIP_SAMPLE.trim(); draw(); });
+  btnLoadMaskSample.addEventListener('click', () => { codeEl.value = MASK_SAMPLE.trim(); draw(); });
+
+  function setCanvasSize(w,h){
+    cvCPU.width=w; cvCPU.height=h;
+    cvGPU.width=w; cvGPU.height=h;
+    cvCPU.style.width='100%'; cvGPU.style.width='100%';
+  }
+  function selectCanvasForRenderer(){
+    const want = rendererSel.value;
+    const hasGPU = !!navigator.gpu;
+    const useGPU = (want==='webgpu') || (want==='auto' && hasGPU);
+    cvGPU.style.display = useGPU ? '' : 'none';
+    cvCPU.style.display = useGPU ? 'none' : '';
+  }
+  selectCanvasForRenderer();
+
+  // ===============================
+  // Math & geometry helpers
+  // ===============================
+  const TAU = Math.PI*2;
+  function angleOf(dx,dy){ return Math.atan2(dy,dx); }
+  function norm(dx,dy){ const L=Math.hypot(dx,dy)||1; return [-dy/L, dx/L]; }
+  function unit(dx,dy){ const L=Math.hypot(dx,dy)||1; return [dx/L, dy/L]; }
+  function arcPoints(cx,cy,r,a0,a1,ccw,segments){
+    let sweep = a1 - a0;
+    if (ccw && sweep < 0) sweep += TAU; else if (!ccw && sweep > 0) sweep -= TAU;
+    const steps = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI/10)));
+    const n = Math.min(segments||steps,64);
+    const pts=[]; for (let i=0;i<=n;i++){
+      const t=i/Math.max(1,n); const a = a0 + sweep*t;
+      pts.push([cx+Math.cos(a)*r, cy+Math.sin(a)*r]);
+    }
+    return pts;
+  }
+  function lineIntersect(p0, v0, p1, v1){
+    const [x0,y0]=p0,[vx0,vy0]=v0,[x1,y1]=p1,[vx1,vy1]=v1;
+    const d = vx0*vy1 - vy0*vx1; if (Math.abs(d) < 1e-6) return null;
+    const t = ((x1-x0)*vy1 - (y1-y0)*vx1) / d;
+    return [x0 + t*vx0, y0 + t*vy0];
+  }
+
+  // ===============================
+  // Stroke expansion
+  // ===============================
+  function strokeToPolys(polyline, width, opts={}){
+    const join = opts.join||'round';
+    const cap = opts.cap||'round';
+    const miterLimit = (opts.miterLimit!=null)? +opts.miterLimit : 4;
+    const polys=[]; if (polyline.length<2) return polys; const hw=width*0.5;
+
+    const isClosed = (polyline.length>=3) &&
+      (polyline[0][0]===polyline[polyline.length-1][0]) &&
+      (polyline[0][1]===polyline[polyline.length-1][1]);
+    const N=polyline.length;
+
+    // segment quads
+    for (let i=0;i<N-1;i++){
+      const [x0,y0]=polyline[i], [x1,y1]=polyline[i+1];
+      const dx=x1-x0, dy=y1-y0; const L=Math.hypot(dx,dy); if (L===0) continue;
+      const [nx,ny]=norm(dx,dy); const hx=nx*hw, hy=ny*hw;
+      polys.push(Float32Array.from([ x0-hx, y0-hy,  x0+hx, y0+hy,  x1+hx, y1+hy,  x1-hx, y1-hy ]));
+    }
+
+    // caps if open
+    if (!isClosed){
+      const [sx0,sy0]=polyline[0], [sx1,sy1]=polyline[1];
+      const [exN1,eyN1]=polyline[N-2], [ex,ey]=polyline[N-1];
+      const sa=angleOf(sx0-sx1,sy0-sy1), ea=angleOf(ex-exN1,ey-eyN1);
+      if (cap==='round'){
+        const cap0 = arcPoints(sx0,sy0,hw,sa-Math.PI/2,sa+Math.PI/2,true,Math.ceil(hw/2));
+        const fan0=[sx0,sy0]; for (const [x,y] of cap0) fan0.push(x,y); polys.push(Float32Array.from(fan0));
+        const cap1 = arcPoints(ex,ey,hw,ea-Math.PI/2,ea+Math.PI/2,true,Math.ceil(hw/2));
+        const fan1=[ex,ey]; for (const [x,y] of cap1) fan1.push(x,y); polys.push(Float32Array.from(fan1));
+      } else if (cap==='square'){
+        const [ux,uy]=unit(sx0-sx1,sy0-sy1); const [nx,ny]=norm(sx0-sx1,sy0-sy1);
+        polys.push(Float32Array.from([
+          sx0-nx*hw, sy0-ny*hw,
+          sx0+nx*hw, sy0+ny*hw,
+          sx0+nx*hw+ux*hw, sy0+ny*hw+uy*hw,
+          sx0-nx*hw+ux*hw, sy0-ny*hw+uy*hw
+        ]));
+        const [ux2,uy2]=unit(ex-exN1,ey-eyN1); const [nx2,ny2]=norm(ex-exN1,ey-eyN1);
+        polys.push(Float32Array.from([
+          ex-nx2*hw, ey-ny2*hw,
+          ex+nx2*hw, ey+ny2*hw,
+          ex+nx2*hw+ux2*hw, ey+ny2*hw+uy2*hw,
+          ex-nx2*hw+ux2*hw, ey-ny2*hw+uy2*hw
+        ]));
+      }
+    }
+
+    // joins
+    const first = isClosed ? 0 : 1;
+    const last  = isClosed ? N-1 : N-2;
+    for (let i=first;i<=last;i++){
+      const im1=(i-1+N)%N, ip1=(i+1)%N;
+      const [xa,ya]=polyline[im1], [xb,yb]=polyline[i], [xc,yc]=polyline[ip1];
+      const v0x=xb-xa, v0y=yb-ya; const v1x=xc-xb, v1y=yc-yb;
+      if ((v0x===0 && v0y===0) || (v1x===0 && v1y===0)) continue;
+
+      const a0=angleOf(v0x,v0y), a1=angleOf(v1x,v1y);
+      const n0=a0+Math.PI/2, n1=a1+Math.PI/2;
+      const cross=(v0x*v1y - v0y*v1x); const ccw=cross>0;
+
+      if (join==='round'){
+        const arc=arcPoints(xb,yb,hw,n0,n1,ccw,Math.ceil(width/2));
+        const fan=[xb,yb]; for (const [x,y] of arc) fan.push(x,y); polys.push(Float32Array.from(fan));
+        continue;
+      }
+
+      const s = ccw ? +1 : -1;
+      const [n0x,n0y]=[Math.cos(n0)*s, Math.sin(n0)*s];
+      const [n1x,n1y]=[Math.cos(n1)*s, Math.sin(n1)*s];
+      const p0=[xb + n0x*hw, yb + n0y*hw];
+      const p1=[xb + n1x*hw, yb + n1y*hw];
+
+      if (join==='bevel'){
+        polys.push(Float32Array.from([xb,yb, p0[0],p0[1], p1[0],p1[1]]));
+      } else if (join==='miter'){
+        const [t0x,t0y]=unit(v0x,v0y); const [t1x,t1y]=unit(v1x,v1y);
+        const m = lineIntersect(p0,[t0x,t0y], p1,[t1x,t1y]);
+        if (!m){ polys.push(Float32Array.from([xb,yb, p0[0],p0[1], p1[0],p1[1]])); continue; }
+        const ml = Math.hypot(m[0]-xb, m[1]-yb) / hw;
+        if (!isFinite(ml) || ml>miterLimit){
+          polys.push(Float32Array.from([xb,yb, p0[0],p0[1], p1[0],p1[1]]));
+        } else {
+          polys.push(Float32Array.from([xb,yb, p0[0],p0[1], m[0],m[1], p1[0],p1[1]]));
+        }
+      }
+    }
+    return polys;
+  }
+
+  // ===============================
+  // SVG path parser
+  // ===============================
+  function parseSVGPathToPath(d){
+    const p = new Path();
+    const re = /([MmZzLlHhVvCcSsQqTtAa])|([+-]?(?:\d*\.\d+|\d+)(?:[eE][+-]?\d+)?)/g;
+    const toks=[]; d.replace(re,(m,cmd,num)=>toks.push(cmd||parseFloat(num)));
+
+    let i=0, cmd=null;
+    let cx=0, cy=0, sx=0, sy=0;
+    let prevC=null, prevQ=null;
+
+    function read(n){ const out=[]; for(let k=0;k<n;k++){ if (i>=toks.length || typeof toks[i]==='string') throw new Error('Bad SVG path data'); out.push(toks[i++]); } return out; }
+    function hasNum(){ return i<toks.length && typeof toks[i] !== 'string'; }
+    const DEG = Math.PI/180;
+
+    function arcToPoints(x0,y0, rx,ry, phiDeg, largeArc, sweep, x1,y1){
+      const phi = (phiDeg%360)*DEG, cosphi=Math.cos(phi), sinphi=Math.sin(phi);
+      if (rx===0 || ry===0) return [[x1,y1]];
+      const dx2=(x0-x1)/2, dy2=(y0-y1)/2;
+      const x1p= cosphi*dx2 + sinphi*dy2;
+      const y1p=-sinphi*dx2 + cosphi*dy2;
+
+      let rx2=rx*rx, ry2=ry*ry;
+      const lam=(x1p*x1p)/rx2 + (y1p*y1p)/ry2;
+      if (lam>1){ const s=Math.sqrt(lam); rx*=s; ry*=s; rx2=rx*rx; ry2=ry*ry; }
+
+      const sign=(largeArc===sweep)?-1:1;
+      const num=rx2*ry2 - rx2*y1p*y1p - ry2*x1p*x1p;
+      const den=rx2*y1p*y1p + ry2*x1p*x1p;
+      const coef=sign*Math.sqrt(Math.max(0,num/den));
+      const cxp=coef*(rx*y1p)/ry;
+      const cyp=coef*(-ry*x1p)/rx;
+
+      const cxAbs=cosphi*cxp - sinphi*cyp + (x0+x1)/2;
+      const cyAbs=sinphi*cxp + cosphi*cyp + (y0+y1)/2;
+
+      function unit(vx,vy){ const L=Math.hypot(vx,vy)||1; return [vx/L, vy/L]; }
+      function ang(u,v){ const a=Math.acos(Math.max(-1,Math.min(1,u[0]*v[0]+u[1]*v[1]))); return (u[0]*v[1]-u[1]*v[0])<0?-a:a; }
+
+      const u=unit((x1p-cxp)/rx, (y1p-cyp)/ry);
+      const v=unit((-x1p-cxp)/rx, (-y1p-cyp)/ry);
+      let theta=ang([1,0],u), delta=ang(u,v);
+      if (!sweep && delta>0) delta-=TAU;
+      if ( sweep && delta<0) delta+=TAU;
+
+      const segs=Math.max(1,Math.ceil(Math.abs(delta)/(Math.PI/12)));
+      const pts=[];
+      for(let k=1;k<=segs;k++){
+        const t=k/segs, a=theta+delta*t;
+        const x=cxAbs + rx*Math.cos(a)*cosphi - ry*Math.sin(a)*sinphi;
+        const y=cyAbs + rx*Math.cos(a)*sinphi + ry*Math.sin(a)*cosphi;
+        pts.push([x,y]);
+      }
+      return pts;
+    }
+
+    while(i<toks.length){
+      if (typeof toks[i]==='string') cmd=toks[i++]; else if (!cmd) throw new Error('SVG path must start with a command');
+
+      switch(cmd){
+        case 'M': case 'm': {
+          const rel=(cmd==='m');
+          const [x,y]=read(2); const nx=rel?cx+x:x, ny=rel?cy+y:y;
+          p.moveTo(nx,ny); cx=nx; cy=ny; sx=nx; sy=ny; prevC=prevQ=null;
+          while(hasNum()){
+            const [x2,y2]=read(2); const nx2=rel?cx+x2:x2, ny2=rel?cy+y2:y2;
+            p.lineTo(nx2,ny2); cx=nx2; cy=ny2; prevC=prevQ=null;
+          }
+          break;
+        }
+        case 'L': case 'l': {
+          const rel=(cmd==='l');
+          while(hasNum()){
+            const [x,y]=read(2); const nx=rel?cx+x:x, ny=rel?cy+y:y;
+            p.lineTo(nx,ny); cx=nx; cy=ny; prevC=prevQ=null;
+          } break;
+        }
+        case 'H': case 'h': {
+          const rel=(cmd==='h');
+          while(hasNum()){
+            const [x]=read(1); const nx=rel?cx+x:x;
+            p.lineTo(nx,cy); cx=nx; prevC=prevQ=null;
+          } break;
+        }
+        case 'V': case 'v': {
+          const rel=(cmd==='v');
+          while(hasNum()){
+            const [y]=read(1); const ny=rel?cy+y:y;
+            p.lineTo(cx,ny); cy=ny; prevC=prevQ=null;
+          } break;
+        }
+        case 'C': case 'c': {
+          const rel=(cmd==='c');
+          while(hasNum()){
+            const [x1,y1,x2,y2,x,y]=read(6);
+            const c1x=rel?cx+x1:x1, c1y=rel?cy+y1:y1;
+            const c2x=rel?cx+x2:x2, c2y=rel?cy+y2:y2;
+            const nx =rel?cx+x :x , ny =rel?cy+y :y ;
+            p.bezierTo(c1x,c1y,c2x,c2y,nx,ny);
+            prevC=[c2x,c2y]; prevQ=null; cx=nx; cy=ny;
+          } break;
+        }
+        case 'S': case 's': {
+          const rel=(cmd==='s');
+          while(hasNum()){
+            const [x2,y2,x,y]=read(4);
+            let c1x=cx, c1y=cy;
+            if (prevC){ c1x=2*cx-prevC[0]; c1y=2*cy-prevC[1]; }
+            const c2x=rel?cx+x2:x2, c2y=rel?cy+y2:y2;
+            const nx =rel?cx+x :x , ny =rel?cy+y :y ;
+            p.bezierTo(c1x,c1y,c2x,c2y,nx,ny);
+            prevC=[c2x,c2y]; prevQ=null; cx=nx; cy=ny;
+          } break;
+        }
+        case 'Q': case 'q': {
+          const rel=(cmd==='q');
+          while(hasNum()){
+            const [x1,y1,x,y]=read(4);
+            const cpx=rel?cx+x1:x1, cpy=rel?cy+y1:y1;
+            const nx =rel?cx+x :x , ny =rel?cy+y :y ;
+            p.quadTo(cpx,cpy,nx,ny);
+            prevQ=[cpx,cpy]; prevC=null; cx=nx; cy=ny;
+          } break;
+        }
+        case 'T': case 't': {
+          const rel=(cmd==='t');
+          while(hasNum()){
+            const [x,y]=read(2);
+            let cpx=cx, cpy=cy;
+            if (prevQ){ cpx=2*cx-prevQ[0]; cpy=2*cy-prevQ[1]; }
+            const nx=rel?cx+x:x, ny=rel?cy+y:y;
+            p.quadTo(cpx,cpy,nx,ny);
+            prevQ=[cpx,cpy]; prevC=null; cx=nx; cy=ny;
+          } break;
+        }
+        case 'A': case 'a': {
+          const rel=(cmd==='a');
+          while(hasNum()){
+            const [rx,ry,phi,laf,sf,x,y]=read(7);
+            const nx=rel?cx+x:x, ny=rel?cy+y:y;
+            const pts=arcToPoints(cx,cy, Math.abs(rx),Math.abs(ry), phi, laf?1:0, sf?1:0, nx,ny);
+            for (const [px,py] of pts) p.lineTo(px,py);
+            cx=nx; cy=ny; prevC=prevQ=null;
+          } break;
+        }
+        case 'Z': case 'z': { p.closePath(); cx=sx; cy=sy; prevC=prevQ=null; break; }
+        default: throw new Error('Unknown SVG path command: '+cmd);
+      }
+    }
+    return p;
+  }
+
+  // ===============================
+  // Prefix scan helper (binning)
+  // ===============================
+  function exclusiveScan(u32){
+    const out=new Uint32Array(u32.length); let acc=0>>>0;
+    for(let i=0;i<u32.length;i++){ out[i]=acc; acc=(acc+u32[i])>>>0; }
+    return {offsets:out,total:acc>>>0};
+  }
+
+  // ===============================
+  // Path class + flatten
+  // ===============================
+  class Path {
+    constructor(){
+      this._subs=[[]];
+      this._curr=[0,0]; this._hasCurr=false;
+      this._tf = { tx:0, ty:0, sx:1, sy:1, rot:0 };
+    }
+    _sub(){ return this._subs[this._subs.length-1]; }
+    moveTo(x,y){ this._curr=[x,y]; this._sub().push({t:'M',x,y}); this._hasCurr=true; return this; }
+    lineTo(x,y){ if(!this._hasCurr) this.moveTo(x,y); else this._sub().push({t:'L',x,y}); this._curr=[x,y]; return this; }
+    quadTo(cpx,cpy,x,y){ this._sub().push({t:'Q',cpx,cpy,x,y}); this._curr=[x,y]; return this; }
+    bezierTo(c1x,c1y,c2x,c2y,x,y){ this._sub().push({t:'C',c1x,c1y,c2x,c2y,x,y}); this._curr=[x,y]; return this; }
+    arc(cx,cy,r,a0,a1,ccw=false,segments){ this._sub().push({t:'A',cx,cy,r,a0,a1,ccw,segments}); const a=ccw?a0:a1; this._curr=[cx+Math.cos(a)*r, cy+Math.sin(a)*r]; return this; }
+    rect(x,y,w,h,rx=0){
+      if(rx<=0){ this.moveTo(x,y).lineTo(x+w,y).lineTo(x+w,y+h).lineTo(x,y+h).closePath(); }
+      else { const r=Math.min(rx,Math.min(w,h)/2); const k=0.552284749831; const c=r*k;
+        this.moveTo(x+r,y).lineTo(x+w-r,y)
+          .bezierTo(x+w-r+c,y, x+w,y+r-c, x+w,y+r)
+          .lineTo(x+w,y+h-r)
+          .bezierTo(x+w,y+h-r+c, x+w-r+c,y+h, x+w-r,y+h)
+          .lineTo(x+r,y+h)
+          .bezierTo(x+r-c,y+h, x,y+h-r+c, x,y+h-r)
+          .lineTo(x,y+r)
+          .bezierTo(x,y+r-c, x+r-c,y, x+r,y)
+          .closePath(); }
+      return this;
+    }
+    ellipse(cx,cy,rx,ry,rot=0,segments=64){ this._sub().push({t:'E',cx,cy,rx,ry,rot,segments}); this._curr=[cx+rx*Math.cos(rot), cy+rx*Math.sin(rot)]; return this; }
+    poly(pts){ if(pts.length){ const [x0,y0]=pts[0]; this.moveTo(x0,y0); for(let i=1;i<pts.length;i++) this.lineTo(pts[i][0],pts[i][1]); } return this; }
+    transform({translateX=0,translateY=0,scaleX=1,scaleY=1,rotate=0}={}){
+      this._tf.tx += translateX; this._tf.ty += translateY;
+      this._tf.sx *= scaleX; this._tf.sy *= scaleY;
+      this._tf.rot += rotate; return this;
+    }
+    closePath(){ this._sub().push({t:'Z'}); this._subs.push([]); this._hasCurr=false; return this; }
+
+    flatten(tol=0.25){
+      const out=[];
+      let curr=[0,0], start=[0,0];
+      let tx=this._tf.tx, ty=this._tf.ty, sx=this._tf.sx, sy=this._tf.sy, rot=this._tf.rot;
+
+      function apply(x,y){
+        const xr=(x*sx), yr=(y*sy);
+        const X = xr*Math.cos(rot) - yr*Math.sin(rot) + tx;
+        const Y = xr*Math.sin(rot) + yr*Math.cos(rot) + ty;
+        return [X,Y];
+      }
+
+      let pts=[]; let closed=false;
+      function flush(forceClose=false){
+        if (pts.length<2){ pts=[]; closed=false; return; }
+        const isClosed = forceClose || closed;
+        const n = pts.length*2 + (isClosed?2:0);
+        const flat = new Float32Array(n);
+        for (let i=0;i<pts.length;i++){ flat[i*2]=pts[i][0]; flat[i*2+1]=pts[i][1]; }
+        if (isClosed){ flat[n-2]=pts[0][0]; flat[n-1]=pts[0][1]; }
+        out.push(flat);
+        pts=[]; closed=false;
+      }
+
+      for (const sub of this._subs){
+        if (!sub.length) continue;
+        for (const cmd of sub){
+          if (cmd.t==='M'){ flush(false); start=apply(cmd.x,cmd.y); curr=start; pts.push(start); continue; }
+          if (cmd.t==='L'){ const p=apply(cmd.x,cmd.y); pts.push(p); curr=p; continue; }
+
+          if (cmd.t==='Q'){
+            const [x0,y0]=curr; const p1=apply(cmd.cpx,cmd.cpy); const p2=apply(cmd.x,cmd.y);
+            const stack=[[x0,y0,p1[0],p1[1],p2[0],p2[1],0]];
+            while(stack.length){
+              const [x0,y0,cx,cy,x1,y1,depth]=stack.pop();
+              const mx=(x0+2*cx+x1)/4, my=(y0+2*cy+y1)/4;
+              const lx=(x0+x1)/2, ly=(y0+y1)/2;
+              const err=Math.hypot(mx-lx,my-ly);
+              if (err<=tol || depth>10){ pts.push([x1,y1]); }
+              else {
+                const q0x=(x0+cx)/2, q0y=(y0+cy)/2;
+                const q1x=(cx+x1)/2, q1y=(cy+y1)/2;
+                const hx=(q0x+q1x)/2, hy=(q0y+q1y)/2;
+                stack.push([hx,hy,q1x,q1y,x1,y1,depth+1]);
+                stack.push([x0,y0,q0x,q0y,hx,hy,depth+1]);
+              }
+            }
+            curr=p2; continue;
+          }
+
+          if (cmd.t==='C'){
+            const [x0,y0]=curr;
+            const p1=apply(cmd.c1x,cmd.c1y), p2=apply(cmd.c2x,cmd.c2y), p3=apply(cmd.x,cmd.y);
+            const stack=[[x0,y0,p1[0],p1[1],p2[0],p2[1],p3[0],p3[1],0]];
+            while(stack.length){
+              const [x0,y0,c1x,c1y,c2x,c2y,x1,y1,depth]=stack.pop();
+              const dx = x1 - x0, dy = y1 - y0;
+              const d1 = Math.abs((c1x - x1)*dy - (c1y - y1)*dx);
+              const d2 = Math.abs((c2x - x1)*dy - (c2y - y1)*dx);
+              if ((d1 + d2) <= tol*6 || depth>10){ pts.push([x1,y1]); }
+              else {
+                const x01=(x0+c1x)/2, y01=(y0+c1y)/2;
+                const x12=(c1x+c2x)/2, y12=(c1y+c2y)/2;
+                const x23=(c2x+x1)/2, y23=(c2y+y1)/2;
+                const xa=(x01+x12)/2, ya=(y01+y12)/2;
+                const xb=(x12+x23)/2, yb=(y12+y23)/2;
+                const xm=(xa+xb)/2, ym=(ya+yb)/2;
+                stack.push([xm,ym,xb,yb,x23,y23,x1,y1,depth+1]);
+                stack.push([x0,y0,x01,y01,xa,ya,xm,ym,depth+1]);
+              }
+            }
+            curr=p3; continue;
+          }
+
+          if (cmd.t==='A'){
+            const ptsArc=arcPoints(cmd.cx,cmd.cy,cmd.r,cmd.a0,cmd.a1,cmd.ccw,cmd.segments||Math.ceil(cmd.r/2));
+            for (let i=1;i<ptsArc.length;i++) pts.push(ptsArc[i]);
+            curr=ptsArc[ptsArc.length-1]; continue;
+          }
+
+          if (cmd.t==='E'){
+            const {cx,cy,rx,ry,rot,segments}=cmd;
+            const steps=Math.max(8,Math.min(segments||64,256));
+            for(let i=1;i<=steps;i++){
+              const t=i/steps*TAU;
+              const x=cx+rx*Math.cos(t), y=cy+ry*Math.sin(t);
+              const xr=(x-cx), yr=(y-cy);
+              const X = xr*Math.cos(rot)-yr*Math.sin(rot)+cx;
+              const Y = xr*Math.sin(rot)+yr*Math.cos(rot)+cy;
+              pts.push([X,Y]);
+            }
+            curr=pts[pts.length-1]; continue;
+          }
+
+          if (cmd.t==='Z'){ closed=true; flush(true); continue; }
+        }
+        flush(false);
+      }
+      return out;
+    }
+  }
+
+  // ===============================
+  // Font loading (opentype) & fallback
+  // ===============================
+  const SIMPLE_FONT = {
+    h:10, a:6, map: {
+      ' ':[], '.':[[3,10],[3,10]], ',':[[3,10],[2,12]], '-':[[1,5],[5,5]], ':':[[3,3],[3,3],[3,8],[3,8]],
+      'A':[[0,10],[3,0],[6,10]], 'B':[[0,0],[0,10],[4,10],[5,9],[5,6],[4,5],[0,5],[4,5],[5,4],[5,1],[4,0],[0,0]],
+      'C':[[6,1],[5,0],[1,0],[0,1],[0,9],[1,10],[5,10],[6,9]],
+      'D':[[0,0],[0,10],[3,10],[6,7],[6,3],[3,0],[0,0]],
+      'E':[[6,0],[0,0],[0,10],[6,10],[0,10],[0,5],[5,5],[0,5],[0,0],[6,0]],
+      'F':[[0,0],[0,10],[6,10],[0,10],[0,5],[5,5]],
+      'G':[[6,1],[5,0],[1,0],[0,1],[0,9],[1,10],[5,10],[6,9],[6,6],[3,6]],
+      'H':[[0,0],[0,10],[0,5],[6,5],[6,10],[6,0]],
+      'I':[[0,0],[6,0],[3,0],[3,10],[0,10],[6,10]],
+      'J':[[6,10],[6,2],[5,0],[3,0],[1,1],[0,3]],
+      'K':[[0,0],[0,10],[0,5],[6,10],[0,5],[6,0]],
+      'L':[[0,10],[0,0],[6,0]],
+      'M':[[0,0],[0,10],[3,6],[6,10],[6,0]],
+      'N':[[0,0],[0,10],[6,0],[6,10]],
+      'O':[[1,0],[5,0],[6,1],[6,9],[5,10],[1,10],[0,9],[0,1],[1,0]],
+      'P':[[0,0],[0,10],[4,10],[5,9],[5,7],[4,6],[0,6]],
+      'Q':[[1,0],[5,0],[6,1],[6,9],[5,10],[1,10],[0,9],[0,1],[1,0],[4,3],[6,0]],
+      'R':[[0,0],[0,10],[4,10],[5,9],[5,7],[4,6],[0,6],[4,6],[6,0]],
+      'S':[[6,1],[5,0],[1,0],[0,1],[0,4],[1,5],[5,5],[6,6],[6,9],[5,10],[1,10],[0,9]],
+      'T':[[0,10],[6,10],[3,10],[3,0]],
+      'U':[[0,10],[0,2],[1,0],[5,0],[6,2],[6,10]],
+      'V':[[0,10],[3,0],[6,10]],
+      'W':[[0,10],[2,0],[3,5],[4,0],[6,10]],
+      'X':[[0,10],[6,0],[3,5],[0,0],[6,10]],
+      'Y':[[0,10],[3,6],[3,0],[3,6],[6,10]],
+      'Z':[[0,10],[6,10],[0,0],[6,0]],
+    }
+  };
+
+  async function loadOpentype(){
+    if (window.opentype) return window.opentype;
+    try{
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/opentype.js@latest/dist/opentype.min.js';
+        s.onload = resolve; s.onerror = reject;
+        document.head.appendChild(s);
+      });
+      return window.opentype || null;
+    } catch (e) {
+      console.warn('opentype.js failed to load; using SIMPLE_FONT fallback.', e);
+      return null;
+    }
+  }
+  async function loadFont(urlOrBuffer){
+    if (urlOrBuffer && urlOrBuffer.__fontReady) return urlOrBuffer;
+    const ot = await loadOpentype();
+    if (!ot) return { __simple: true, __fontReady:true };
+    try {
+      if (typeof urlOrBuffer === 'string') {
+        return await new Promise((res, rej) =>
+          ot.load(urlOrBuffer, (err, font) => err ? rej(err) : res(Object.assign(font,{__fontReady:true})))
+        );
+      } else {
+        return Object.assign(ot.parse(urlOrBuffer), {__fontReady:true});
+      }
+    } catch (e) {
+      console.warn('Font load failed, using SIMPLE_FONT fallback:', e);
+      return { __simple: true, __fontReady:true };
+    }
+  }
+
+  function textToPath(font, text, x, y, size, opts={}){
+    const align = opts.align||'left';
+    const letterSpacing = +opts.letterSpacing||0;
+
+    if (font && !font.__simple && font.getPath){
+      const options = { kerning: true, features: { liga: true } };
+      let adv = font.getAdvanceWidth(text, size, options) + letterSpacing * Math.max(0, text.length-1);
+      let penX = x, penY = y;
+      if (align==='center') penX -= adv*0.5;
+      else if (align==='right') penX -= adv;
+
+      const gp = font.getPath(text, penX, penY, size, options);
+      const path = new Path();
+      let open=false;
+      for (const c of gp.commands){
+        if (c.type==='M'){ path.moveTo(c.x, c.y); open=true; }
+        else if (c.type==='L'){ path.lineTo(c.x, c.y); }
+        else if (c.type==='Q'){ path.quadTo(c.x1,c.y1, c.x,c.y); }
+        else if (c.type==='C'){ path.bezierTo(c.x1,c.y1, c.x2,c.y2, c.x,c.y); }
+        else if (c.type==='Z'){ path.closePath(); open=false; }
+      }
+      if (open) path.closePath();
+      return path;
+    }
+
+    // fallback stroke font
+    const path = new Path();
+    const adv = SIMPLE_FONT.a * (size/SIMPLE_FONT.h);
+    let penX = x, penY=y; const s = size/SIMPLE_FONT.h;
+
+    if (align!=='left'){
+      let count=0; for (const _ of text){ count++; }
+      const width = count*adv + Math.max(0,count-1)*letterSpacing;
+      if (align==='center') penX -= width/2; else if (align==='right') penX -= width;
+    }
+
+    for (const raw of text){
+      const ch = (SIMPLE_FONT.map[raw] ? raw : raw.toUpperCase());
+      const poly = SIMPLE_FONT.map[ch];
+      if (poly && poly.length){
+        const [x0,y0] = [penX + poly[0][0]*s, penY + (SIMPLE_FONT.h-poly[0][1])*s];
+        path.moveTo(x0,y0);
+        for (let i=1;i<poly.length;i++){
+          const px = penX + poly[i][0]*s;
+          const py = penY + (SIMPLE_FONT.h-poly[i][1])*s;
+          path.lineTo(px,py);
+        }
+      }
+      penX += (raw===' ' ? adv*0.6 : adv) + letterSpacing;
+    }
+    path.closePath();
+    return path;
+  }
+
+  // ===============================
+  // Path Builder API (with Clip/Mask/Opacity stacks)
+  // ===============================
+  let randomLines=[];
+  function randomizeLines(forceNew=false){
+    const [W,H]=[cvCPU.width,cvCPU.height]; const pts=[]; const N=220; let x=W*0.15,y=H*0.25; const step=Math.min(W,H)*0.03;
+    for(let i=0;i<N;i++){ x=Math.max(20,Math.min(W-20,x+(Math.random()-0.5)*step*2)); y=Math.max(20,Math.min(H-20,y+(Math.random()-0.5)*step*2)); pts.push([x,y]); }
+    if (forceNew || randomLines.length===0) randomLines=pts; return randomLines;
+  }
+  function star(cx,cy,ro,ri,n=5){ const pts=[]; const step=Math.PI/n; for(let i=0;i<2*n;i++){ const r=(i%2===0)?ro:ri; const a=i*step-Math.PI/2; pts.push([cx+Math.cos(a)*r, cy+Math.sin(a)*r]); } return pts; }
+
+  function createAPI(builder){
+    const getOpacity = ()=> builder.opacityStack.reduce((a,b)=>a*b, 1.0);
+    const collectClipRefs = ()=> builder.clipStack.flat();
+    const collectMaskRefs = ()=> builder.maskStack.flat();
+
+    function ensurePath(x){
+      if (x instanceof Path) return x;
+      if (typeof x === 'string') return parseSVGPathToPath(x);
+      throw new Error('Expected Path or SVG path "d" string.');
+    }
+
+    function addClipFromPath(path, rule){
+      const flats = path.flatten(0.35);
+      const ids=[];
+      for (const verts of flats){
+        if (verts.length >= 6){
+          const n=verts.length;
+          const closed=(verts[0]===verts[n-2] && verts[1]===verts[n-1]);
+          if (closed){
+            const id = builder.clipPolys.length;
+            builder.clipPolys.push({ verts, rule: rule||fillRule });
+            ids.push(id);
+          }
+        }
+      }
+      return ids;
+    }
+    function addMaskFromPath(path, alpha, rule){
+      const a = Math.max(0, Math.min(1, +alpha));
+      const flats = path.flatten(0.35);
+      const ids=[];
+      for (const verts of flats){
+        if (verts.length >= 6){
+          const n=verts.length;
+          const closed=(verts[0]===verts[n-2] && verts[1]===verts[n-1]);
+          if (closed){
+            const id = builder.maskPolys.length;
+            builder.maskPolys.push({ verts, rule: rule||fillRule, alpha: a });
+            ids.push(id);
+          }
+        }
+      }
+      return ids;
+    }
+
+    const fillPathImpl = (path, rgba, rule) => {
+      const polys = path.flatten(0.35);
+      const clipRefs = collectClipRefs();
+      const maskRefs = collectMaskRefs();
+      const opacity = getOpacity();
+      for (const verts of polys){
+        if (verts.length<6) continue;
+        const n = verts.length;
+        const closed = (verts[0]===verts[n-2] && verts[1]===verts[n-1]);
+        if (closed) builder.shapes.push({
+          verts, color: rgba, rule: rule||fillRule,
+          clipRefs: clipRefs.slice(0), maskRefs: maskRefs.slice(0), opacity
+        });
+      }
+    };
+
+    const strokePathImpl = (path, width, rgba, opts={}) => {
+      const flats = path.flatten(0.35);
+      const clipRefs = collectClipRefs();
+      const maskRefs = collectMaskRefs();
+      const opacity = getOpacity();
+      for (const flat of flats){
+        const pts=[]; for (let i=0;i<flat.length;i+=2) pts.push([flat[i],flat[i+1]]);
+        const pieces = strokeToPolys(pts, width, opts);
+        for (const poly of pieces) builder.shapes.push({
+          verts: poly, color: rgba, rule: 'evenodd',
+          clipRefs: clipRefs.slice(0), maskRefs: maskRefs.slice(0), opacity
+        });
+      }
+    };
+
+    return {
+      width: () => cvCPU.width,
+      height: () => cvCPU.height,
+      rule: () => fillRule,
+      param: (name) => {
+        if (name==='strokeWidth') return Number(strokeInp.value);
+        if (name==='join') return String(joinSel.value);
+        if (name==='cap') return String(capSel.value);
+        if (name==='miterLimit') return Number(miterInp.value);
+        return undefined;
+      },
+      color: (r,g,b,a) => Uint8ClampedArray.from([r|0,g|0,b|0,(a|0)]),
+      path: () => new Path(),
+      star: (cx,cy,ro,ri,n)=>star(cx,cy,ro,ri,n),
+      randomPolyline: (N)=> randomizeLines().slice(0,N|0),
+
+      // time API
+      time: () => anim.t || 0,
+      dt:   () => anim.dt || 0,
+      frame:() => anim.frame|0,
+
+      // fonts & text
+      loadFont: (src) => loadFont(src),
+      textPath: (font, text, x, y, size, opts) => textToPath(font, text, x, y, size, opts),
+      fillText: (font, text, x, y, size, rgba, opts={}) => {
+        const p = textToPath(font, text, x, y, size, opts);
+        const flats = p.flatten(0.35);
+        const clipRefs = collectClipRefs();
+        const maskRefs = collectMaskRefs();
+        const opacity = getOpacity();
+        if (font && font.__simple){
+          const width = Math.max(1, size*0.12);
+          for (const flat of flats){
+            const pts=[]; for (let i=0;i<flat.length;i+=2) pts.push([flat[i],flat[i+1]]);
+            for (const poly of strokeToPolys(pts, width, { join:'round', cap:'round' }))
+              builder.shapes.push({ verts: poly, color: rgba, rule: 'evenodd', clipRefs: clipRefs.slice(0), maskRefs: maskRefs.slice(0), opacity });
+          }
+        } else {
+          for (const verts of flats){
+            if (verts.length >= 6){
+              const n = verts.length;
+              const closed = (verts[0]===verts[n-2] && verts[1]===verts[n-1]);
+              if (closed) builder.shapes.push({ verts, color: rgba, rule: fillRule, clipRefs: clipRefs.slice(0), maskRefs: maskRefs.slice(0), opacity });
+            }
+          }
+        }
+      },
+      strokeText: (font, text, x, y, size, width, rgba, opts={}) => {
+        const p = textToPath(font, text, x, y, size, opts);
+        const flats = p.flatten(0.35);
+        const clipRefs = collectClipRefs();
+        const maskRefs = collectMaskRefs();
+        const opacity = getOpacity();
+        for (const flat of flats) {
+          const pts = []; for (let i=0;i<flat.length;i+=2) pts.push([flat[i], flat[i+1]]);
+          for (const poly of strokeToPolys(pts, width, opts))
+            builder.shapes.push({ verts: poly, color: rgba, rule: 'evenodd', clipRefs: clipRefs.slice(0), maskRefs: maskRefs.slice(0), opacity });
+        }
+      },
+
+      // SVG helpers
+      svgPath: (d) => parseSVGPathToPath(d),
+      fillSVG: (d, rgba, rule) => fillPathImpl(parseSVGPathToPath(d), rgba, rule),
+      strokeSVG: (d, width, rgba, opts={}) => {
+        const p = parseSVGPathToPath(d);
+        const flats = p.flatten(0.35);
+        const clipRefs = collectClipRefs();
+        const maskRefs = collectMaskRefs();
+        const opacity = getOpacity();
+        for (const flat of flats){
+          const pts=[]; for (let i=0;i<flat.length;i+=2) pts.push([flat[i],flat[i+1]]);
+          for (const poly of strokeToPolys(pts, width, opts))
+            builder.shapes.push({ verts: poly, color: rgba, rule: 'evenodd', clipRefs: clipRefs.slice(0), maskRefs: maskRefs.slice(0), opacity });
+        }
+      },
+
+      // Core fill/stroke
+      fillPath: fillPathImpl,
+      strokePath: strokePathImpl,
+
+      // Clipping stack
+      pushClip: (pOrD, rule) => { const ids = addClipFromPath(ensurePath(pOrD), rule); builder.clipStack.push(ids); },
+      popClip: () => { builder.clipStack.pop(); },
+      withClip: async (pOrD, rule, fn) => { const ids = addClipFromPath(ensurePath(pOrD), rule); builder.clipStack.push(ids); try { await fn(); } finally { builder.clipStack.pop(); } },
+
+      // Opacity stack
+      pushOpacity: (a) => { const v = Math.max(0, Math.min(1, +a)); builder.opacityStack.push(v); },
+      popOpacity: () => { if (builder.opacityStack.length>0) builder.opacityStack.pop(); },
+
+      // Opacity mask stack
+      pushOpacityMask: (pOrD, alpha=1.0, rule) => { const ids = addMaskFromPath(ensurePath(pOrD), alpha, rule); builder.maskStack.push(ids); },
+      popOpacityMask: () => { builder.maskStack.pop(); },
+      withOpacityMask: async (pOrD, alpha=1.0, rule, fn) => { const ids = addMaskFromPath(ensurePath(pOrD), alpha, rule); builder.maskStack.push(ids); try { await fn(); } finally { builder.maskStack.pop(); } },
+    };
+  }
+
+  function packScene(builder){
+    // Flatten per-shape ref arrays to global ref buffers, assign ranges
+    const clipRefs = [];
+    const maskRefs = [];
+    const shapesPacked = [];
+    for (const s of builder.shapes){
+      const clipStart = clipRefs.length;
+      for (const id of (s.clipRefs||[])) clipRefs.push(id>>>0);
+      const clipCount = clipRefs.length - clipStart;
+      const maskStart = maskRefs.length;
+      for (const id of (s.maskRefs||[])) maskRefs.push(id>>>0);
+      const maskCount = maskRefs.length - maskStart;
+      shapesPacked.push({
+        verts: s.verts, color: s.color, rule: s.rule,
+        clipStart, clipCount, maskStart, maskCount,
+        opacity: (s.opacity != null ? s.opacity : 1.0)
+      });
+    }
+    return {
+      shapes: shapesPacked,
+      clipPolys: builder.clipPolys,
+      maskPolys: builder.maskPolys,
+      clipRefs: new Uint32Array(clipRefs),
+      maskRefs: new Uint32Array(maskRefs),
+    };
+  }
+
+  async function buildSceneFromCode(code){
+    const builder = {
+      shapes: [],
+      clipPolys: [],
+      maskPolys: [],
+      clipStack: [],
+      maskStack: [],
+      opacityStack: [1.0],
+    };
+    const api=createAPI(builder);
+    try {
+      const run = new Function('api', return (async () => { ${code}\n })());
+      await run(api);
+    } catch(e){
+      console.error('User code error:', e);
+      alert('Error in your code: '+ e.message);
+      return null;
+    }
+    return packScene(builder);
+  }
+
+  function fallbackScene(){
+    const [W,H]=[cvCPU.width,cvCPU.height];
+    const shapes=[];
+    // star
+    const s=star(W*0.5,H*0.45,Math.min(W,H)*0.26,Math.min(W,H)*0.11,7);
+    shapes.push({ verts: Float32Array.from(s.flat()), color: Uint8ClampedArray.from([88,156,255,220]), rule: fillRule,
+      clipStart:0, clipCount:0, maskStart:0, maskCount:0, opacity:1.0 });
+    // stroke random poly
+    for (const p of strokeToPolys(randomizeLines(), Number(strokeInp.value),
+          { join:joinSel.value, cap:capSel.value, miterLimit:Number(miterInp.value) })) {
+      shapes.push({ verts:p, color: Uint8ClampedArray.from([250,245,140,255]), rule:'evenodd',
+        clipStart:0, clipCount:0, maskStart:0, maskCount:0, opacity:1.0 });
+    }
+    return { shapes, clipPolys:[], maskPolys:[], clipRefs:new Uint32Array(0), maskRefs:new Uint32Array(0) };
+  }
+
+  // ===============================
+  // Tiling (count → scan → scatter)
+  // ===============================
+  function binShapesIntoTiles(scene,tileSize, W, H){
+    const shapes = scene.shapes;
+    const tilesX=Math.ceil(W/tileSize), tilesY=Math.ceil(H/tileSize);
+    const tileCount=tilesX*tilesY; const counts=new Uint32Array(tileCount); const ranges=new Array(shapes.length);
+    for(let sIdx=0;sIdx<shapes.length;sIdx++){
+      const v=shapes[sIdx].verts; let minX=+Infinity,minY=+Infinity,maxX=-Infinity,maxY=-Infinity;
+      for(let i=0;i<v.length;i+=2){ const x=v[i],y=v[i+1]; if(x<minX)minX=x; if(y<minY)minY=y; if(x>maxX)maxX=x; if(y>maxY)maxY=y; }
+      const minTx=Math.max(0,Math.floor(minX/tileSize));
+      const maxTx=Math.min(tilesX-1,Math.floor(maxX/tileSize));
+      const minTy=Math.max(0,Math.floor(minY/tileSize));
+      const maxTy=Math.min(tilesY-1,Math.floor(maxY/tileSize));
+      ranges[sIdx]={minTx,maxTx,minTy,maxTy};
+      for(let ty=minTy;ty<=maxTy;ty++) for(let tx=minTx;tx<=maxTx;tx++) counts[ty*tilesX+tx]++;
+    }
+    const {offsets,total}=exclusiveScan(counts); const tileShapeIndex=new Uint32Array(total); const cursors=offsets.slice();
+    for (let sIdx=0;sIdx<shapes.length;sIdx++){
+      const r=ranges[sIdx];
+      for(let ty=r.minTy;ty<=r.maxTy;ty++)
+        for(let tx=r.minTx;tx<=r.maxTx;tx++){
+          const t=ty*tilesX+tx; tileShapeIndex[cursors[t]++]=sIdx;
+        }
+    }
+    return {tilesX,tilesY,tileCount,counts,offsets,tileShapeIndex};
+  }
+
+  // ===============================
+  // CPU worker raster (span + per-sample for clip/mask)
+  // ===============================
+  let cpuWorkerURL = null;
+  let cpuWorkers = [];
+  function makeWorkerURL(){
+    const workerFn=()=>{
+      function toPremul(rgba){ const a=rgba[3]/255; return [rgba[0]/255*a, rgba[1]/255*a, rgba[2]/255*a, a]; }
+      function over(dst,i,sr,sg,sb,sa){ const ida=1-sa; dst[i]=sr+dst[i]*ida; dst[i+1]=sg+dst[i+1]*ida; dst[i+2]=sb+dst[i+2]*ida; dst[i+3]=sa+dst[i+3]*ida; }
+
+      // Scanline fill (fast path, no clip/mask)
+      function fillRowEvenOdd(xs, sTileX, sW, base, outF32, sr,sg,sb,sa){
+        if (xs.length<2) return;
+        xs.sort((a,b)=>a-b);
+        for (let k=0; k+1<xs.length; k+=2){
+          let x0 = Math.floor((xs[k]   - sTileX) + 0.0);
+          let x1 = Math.floor((xs[k+1] - sTileX) + 0.0);
+          if (x1<=0 || x0>=sW) continue;
+          if (x0<0) x0=0; if (x1>sW) x1=sW;
+          let i = base + (x0<<2), end = base + (x1<<2);
+          for (; i+16<=end; i+=16){ over(outF32,i,sr,sg,sb,sa); over(outF32,i+4,sr,sg,sb,sa); over(outF32,i+8,sr,sg,sb,sa); over(outF32,i+12,sr,sg,sb,sa); }
+          for (; i<end; i+=4){ over(outF32,i,sr,sg,sb,sa); }
+        }
+      }
+      function fillRowNonZero(events, sTileX, sW, base, outF32, sr,sg,sb,sa){
+        if (events.length===0) return;
+        events.sort((a,b)=>a.x-b.x);
+        let w=0, spanStart=null;
+        let j=0;
+        while (j<events.length){
+          const x = events[j].x;
+          let sum=0; do { sum += events[j].w; j++; } while(j<events.length && events[j].x===x);
+          const prevW = w; w += sum;
+          if (prevW===0 && w!==0){
+            spanStart = x;
+          } else if (prevW!==0 && w===0){
+            let x0=Math.floor((spanStart - sTileX)+0.0);
+            let x1=Math.floor((x - sTileX)+0.0);
+            if (x1<=0 || x0>=sW) continue;
+            if (x0<0) x0=0; if (x1>sW) x1=sW;
+            let i = base + (x0<<2), end = base + (x1<<2);
+            for (; i+16<=end; i+=16){ over(outF32,i,sr,sg,sb,sa); over(outF32,i+4,sr,sg,sb,sa); over(outF32,i+8,sr,sg,sb,sa); over(outF32,i+12,sr,sg,sb,sa); }
+            for (; i<end; i+=4){ over(outF32,i,sr,sg,sb,sa); }
+            spanStart=null;
+          }
+        }
+      }
+
+      // Point-in-polygon (used when clip or mask present)
+      function insideEvenOdd(verts, x, y){
+        let inside=false;
+        const n = (verts.length>>>1);
+        for (let i=0,j=n-1;i<n;j=i++){
+          const xi=verts[(i<<1)], yi=verts[(i<<1)+1];
+          const xj=verts[(j<<1)], yj=verts[(j<<1)+1];
+          const cond = ((yi > y) !== (yj > y));
+          if (cond){
+            const xin = ( (xj - xi) * (y - yi) / (yj - yi) + xi );
+            if (x < xin) inside = !inside;
+          }
+        }
+        return inside;
+      }
+      function isLeft(ax,ay, bx,by, px,py){ return (bx-ax)*(py-ay) - (by-ay)*(px-ax); }
+      function insideNonZero(verts, x, y){
+        let winding=0;
+        const n=(verts.length>>>1);
+        for (let i=0,j=n-1;i<n;j=i++){
+          const xi=verts[(i<<1)], yi=verts[(i<<1)+1];
+          const xj=verts[(j<<1)], yj=verts[(j<<1)+1];
+          if (yi <= y){
+            if (yj > y){
+              if (isLeft(xi,yi,xj,yj,x,y) > 0) winding++;
+            }
+          } else {
+            if (yj <= y){
+              if (isLeft(xi,yi,xj,yj,x,y) < 0) winding--;
+            }
+          }
+        }
+        return winding !== 0;
+      }
+      function insideByRule(verts, rule, x, y){
+        return (rule === 'evenodd') ? insideEvenOdd(verts,x,y) : insideNonZero(verts,x,y);
+      }
+
+      // Generic per-sample renderer for a shape with clip/mask/opacity
+      function renderShapePerSample(tileX,tileY,tileW,tileH,shape,clips,clipRefs, masks, maskRefs, outF32, SS){
+        const sW = tileW*SS, sH = tileH*SS;
+        const pitch = sW*4;
+        const [sr0,sg0,sb0,sa0] = toPremul(shape.color);
+        const op = shape.opacity != null ? shape.opacity : 1.0;
+
+        for (let ry=0; ry<sH; ry++){
+          const fy = tileY + (ry + 0.5)/SS;
+          const base = ry*pitch;
+          for (let rx=0; rx<sW; rx++){
+            const fx = tileX + (rx + 0.5)/SS;
+
+            // subject coverage
+            if (!insideByRule(shape.verts, shape.rule, fx, fy)) continue;
+
+            // clip: intersection of all active clip polys
+            let ok = true;
+            for (let c=0; c<shape.clipCount; c++){
+              const cid = clipRefs[shape.clipStart + c]>>>0;
+              const cpoly = clips[cid];
+              if (!insideByRule(cpoly.verts, cpoly.rule, fx, fy)){ ok=false; break; }
+            }
+            if (!ok) continue;
+
+            // mask: union alpha of all active mask polys
+            let m = 1.0;
+            if (shape.maskCount>0){
+              m = 0.0;
+              for (let mi=0; mi<shape.maskCount; mi++){
+                const mid = maskRefs[shape.maskStart + mi]>>>0;
+                const mpoly = masks[mid];
+                if (insideByRule(mpoly.verts, mpoly.rule, fx, fy)){
+                  const a = Math.max(0, Math.min(1, mpoly.alpha||1));
+                  m = m + (1.0 - m)*a;
+                }
+              }
+            }
+
+            const f = op * m;
+            if (f <= 0.00001) continue;
+            const sr = sr0*f, sg = sg0*f, sb = sb0*f, sa = sa0*f;
+            const i = base + (rx<<2);
+            over(outF32, i, sr,sg,sb,sa);
+          }
+        }
+      }
+
+      function downsampleSSAA(srcF32,tileW,tileH,SS){
+        if(SS===1){
+          const out=new Uint8ClampedArray(tileW*tileH*4);
+          for(let p=0;p<tileW*tileH;p++){
+            const i=p*4; const a=Math.min(1,Math.max(0,srcF32[i+3]));
+            const r=a>1e-6? Math.round((srcF32[i]/a)*255):0;
+            const g=a>1e-6? Math.round((srcF32[i+1]/a)*255):0;
+            const b=a>1e-6? Math.round((srcF32[i+2]/a)*255):0;
+            const A=Math.round(a*255);
+            out[i]=r; out[i+1]=g; out[i+2]=b; out[i+3]=A;
+          }
+          return out;
+        }
+        const sW=tileW*SS, sH=tileH*SS; const out=new Uint8ClampedArray(tileW*tileH*4);
+        const area=SS*SS;
+        for(let y=0;y<tileH;y++){
+          for(let x=0;x<tileW;x++){
+            let r=0,g=0,b=0,a=0;
+            const base = (y*sW*SS + x*SS)*4;
+            for(let j=0;j<SS;j++){
+              let idx=base + j*sW*4;
+              for(let i=0;i<SS;i++,idx+=4){
+                r+=srcF32[idx]; g+=srcF32[idx+1]; b+=srcF32[idx+2]; a+=srcF32[idx+3];
+              }
+            }
+            r/=area; g/=area; b/=area; a/=area; const o=(y*tileW+x)*4;
+            const A=Math.min(1,a);
+            out[o  ]=A>1e-6? Math.round((r/A)*255):0;
+            out[o+1]=A>1e-6? Math.round((g/A)*255):0;
+            out[o+2]=A>1e-6? Math.round((b/A)*255):0;
+            out[o+3]=Math.round(A*255);
+          }
+        }
+        return out;
+      }
+
+      self.onmessage=(e)=>{
+        const msg=e.data; if(!msg || msg.cmd!=='renderTiles') return;
+        const {
+          tileSize, canvasW, canvasH, tilesX, tileIndices, offsets, counts, tileShapeIndex,
+          shapes, clips, clipRefs, masks, maskRefs, SS
+        } = msg;
+
+        const results=[];
+        for(const t of tileIndices){
+          const tx=t%tilesX, ty=(t/tilesX)|0;
+          const tileX=tx*tileSize, tileY=ty*tileSize;
+          const tileW=Math.min(tileSize, canvasW-tileX), tileH=Math.min(tileSize, canvasH-tileY);
+          const fbuf=new Float32Array((tileW*SS)*(tileH*SS)*4);
+          const start=offsets[t]>>>0, cnt=counts[t]>>>0;
+
+          for(let i=0;i<cnt;i++){
+            const sIdx=tileShapeIndex[start+i]>>>0;
+            const sh=shapes[sIdx];
+
+            // Fast path if no clip and no mask
+            if ((sh.clipCount|0)===0 && (sh.maskCount|0)===0){
+              const [sr,sg,sb,sa0] = toPremul(sh.color);
+              const fop = (sh.opacity != null ? sh.opacity : 1.0);
+              const sa = sa0 * fop;
+              const sr2 = sr * fop;
+              const sg2 = sg * fop;
+              const sb2 = sb * fop;
+
+              const sW=tileW*SS, sH=tileH*SS; const sTileX=tileX, sTileY=tileY;
+              const pitch=sW*4;
+
+              for(let ry=0; ry<sH; ry++){
+                const gy = sTileY + (ry + 0.5)/SS;
+                const base=ry*pitch;
+
+                if(sh.rule==='evenodd'){
+                  const xs=[];
+                  const v=sh.verts; const n=v.length>>>1;
+                  for(let ii=0,jj=n-1; ii<n; jj=ii++){
+                    const x0=v[(jj<<1)], y0=v[(jj<<1)+1];
+                    const x1=v[(ii<<1)], y1=v[(ii<<1)+1];
+                    const yMin=(y0<y1)?y0:y1, yMax=(y0>y1)?y0:y1;
+                    if(gy<=yMin || gy>yMax) continue;
+                    const t0=(gy-y0)/(y1-y0); xs.push(x0+t0*(x1-x0));
+                  }
+                  fillRowEvenOdd(xs, sTileX, sW, base, fbuf, sr2,sg2,sb2,sa);
+                } else {
+                  const ev=[];
+                  const v=sh.verts; const n=v.length>>>1;
+                  for(let ii=0,jj=n-1; ii<n; jj=ii++){
+                    const x0=v[(jj<<1)], y0=v[(jj<<1)+1];
+                    const x1=v[(ii<<1)], y1=v[(ii<<1)+1];
+                    const yMin=(y0<y1)?y0:y1, yMax=(y0>y1)?y0:y1;
+                    if(gy<=yMin || gy>yMax) continue;
+                    const t0=(gy-y0)/(y1-y0); const x=x0+t0*(x1-x0);
+                    ev.push({x, w:(y1>y0)?+1:-1});
+                  }
+                  fillRowNonZero(ev, sTileX, sW, base, fbuf, sr2,sg2,sb2,sa);
+                }
+              }
+            } else {
+              // Generic per-sample path with clip/mask/opacity
+              renderShapePerSample(tileX,tileY,tileW,tileH, sh, clips, clipRefs, masks, maskRefs, fbuf, SS);
+            }
+          }
+
+          const pixels=downsampleSSAA(fbuf,tileW,tileH,SS);
+          results.push({ t, tx, ty, tileX, tileY, tileW, tileH, pixels });
+        }
+        self.postMessage({ kind:'tilesDone', results }, results.map(r=>r.pixels.buffer));
+      };
+    };
+    const src=(${workerFn.toString()})();
+    const blob=new Blob([src],{type:'text/javascript'});
+    return URL.createObjectURL(blob);
+  }
+  function ensureWorkerPool(n){
+    if (!cpuWorkerURL) cpuWorkerURL = makeWorkerURL();
+    const cur = cpuWorkers.length;
+    if (cur < n){
+      for (let i=cur;i<n;i++) cpuWorkers.push(new Worker(cpuWorkerURL));
+    } else if (cur > n){
+      for (let i=n;i<cur;i++){ cpuWorkers[i].terminate(); }
+      cpuWorkers.length = n;
+    }
+  }
+
+  // ===============================
+  // WebGPU setup & pipelines — STORAGE BUFFER COUNT ≤ 8
+  // ===============================
+  const WGSL_COMPUTE = /* wgsl */
+struct Uniforms {
+  canvasW : u32,
+  canvasH : u32,
+  tileSize: u32,
+  tilesX  : u32,
+  SS      : u32,
+  _padA   : u32,
+  _padB   : u32,
+  _padC   : u32,
+};
+
+// 64-byte shape (matches JS packing: 16 f32 = 64B)
+struct Shape {
+  vStart : u32,
+  vCount : u32,
+  rule   : u32,   // 0=evenodd, 1=nonzero
+  _pad0  : u32,
+  color  : vec4f, // premultiplied RGBA
+  clipStart : u32,
+  clipCount : u32,
+  maskStart : u32,
+  maskCount : u32,
+  opacity   : f32,
+  _pad1     : f32,
+  _pad2     : f32,
+  _pad3     : f32,
+};
+
+// 32-byte clip (u32x4)
+struct ClipPoly {
+  vStart : u32,
+  vCount : u32,
+  rule   : u32,
+  _pad0  : u32,
+};
+
+// 32-byte mask (matches JS packing: 8 f32 = 32B)
+struct MaskPoly {
+  vStart : u32,
+  vCount : u32,
+  rule   : u32,
+  _pad0  : u32,
+  alpha  : f32,
+  _pad1  : f32,
+  _pad2  : f32,
+  _pad3  : f32,
+};
+
+@group(0) @binding(0) var<uniform> uni : Uniforms;
+@group(0) @binding(1) var<storage, read> shapes : array<Shape>;
+@group(0) @binding(2) var<storage, read> vertices : array<vec2f>;
+@group(0) @binding(3) var<storage, read> tileOC : array<u32>;          // [off0,count0, off1,count1, ...]
+@group(0) @binding(4) var<storage, read> tileShapeIx : array<u32>;
+@group(0) @binding(5) var<storage, read> clips : array<ClipPoly>;
+@group(0) @binding(6) var<storage, read> masks : array<MaskPoly>;
+@group(0) @binding(7) var<storage, read> refs : array<u32>;            // all clipRefs then maskRefs
+@group(0) @binding(8) var outputTex : texture_storage_2d<rgba8unorm, write>;
+
+fn point_in_evenodd(vStart:u32, vCount:u32, x:f32, y:f32) -> bool {
+  var inside = false;
+  var i = 0u;
+  var j = vCount - 1u;
+  loop {
+    if (i >= vCount) { break; }
+    let pi = vertices[vStart + i];
+    let pj = vertices[vStart + j];
+    let cond = ( (pi.y > y) != (pj.y > y) );
+    if (cond) {
+      let xin = ( (pj.x - pi.x) * (y - pi.y) / (pj.y - pi.y) + pi.x );
+      if (x < xin) { inside = !inside; }
+    }
+    j = i;
+    i = i + 1u;
+  }
+  return inside;
+}
+
+fn isLeft(a:vec2f, b:vec2f, p:vec2f) -> f32 {
+  return (b.x - a.x)*(p.y - a.y) - (b.y - a.y)*(p.x - a.x);
+}
+
+fn point_in_nonzero(vStart:u32, vCount:u32, x:f32, y:f32) -> bool {
+  var winding : i32 = 0;
+  var i = 0u;
+  var j = vCount - 1u;
+  let P = vec2f(x,y);
+  loop {
+    if (i >= vCount) { break; }
+    let pi = vertices[vStart + i];
+    let pj = vertices[vStart + j];
+
+    if (pi.y <= y) {
+      if (pj.y > y) {
+        if (isLeft(pi, pj, P) > 0.0) { winding = winding + 1; }
+      }
+    } else {
+      if (pj.y <= y) {
+        if (isLeft(pi, pj, P) < 0.0) { winding = winding - 1; }
+      }
+    }
+
+    j = i;
+    i = i + 1u;
+  }
+  return winding != 0;
+}
+
+fn inside_by_rule(vStart:u32, vCount:u32, rule:u32, x:f32, y:f32) -> bool {
+  return select( point_in_nonzero(vStart,vCount,x,y), point_in_evenodd(vStart,vCount,x,y), rule==0u );
+}
+
+fn over(src:vec4f, dst:vec4f) -> vec4f {
+  let ida = 1.0 - src.a;
+  return vec4f(src.rgb + ida * dst.rgb, src.a + ida * dst.a);
+}
+
+@compute @workgroup_size(8,8,1)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= uni.canvasW || gid.y >= uni.canvasH) { return; }
+  let x = gid.x;
+  let y = gid.y;
+
+  let tX = x / uni.tileSize;
+  let tY = y / uni.tileSize;
+  let t  = tY * uni.tilesX + tX;
+
+  let metaOff = t * 2u;
+  let start = tileOC[metaOff + 0u];
+  let cnt   = tileOC[metaOff + 1u];
+
+  var accum : vec4f = vec4f(0.0);
+  let SS = uni.SS;
+  let fSS = f32(SS);
+  let invN = 1.0 / (fSS * fSS);
+
+  var sy : u32 = 0u;
+  loop {
+    if (sy >= SS) { break; }
+    var sx : u32 = 0u;
+    loop {
+      if (sx >= SS) { break; }
+      let fx = f32(x) + (f32(sx) + 0.5) / fSS;
+      let fy = f32(y) + (f32(sy) + 0.5) / fSS;
+
+      var col : vec4f = vec4f(0.0);
+      var k : u32 = 0u;
+      loop {
+        if (k >= cnt) { break; }
+        let sIdx = tileShapeIx[start + k];
+        let sh = shapes[sIdx];
+
+        if (inside_by_rule(sh.vStart, sh.vCount, sh.rule, fx, fy)) {
+          var ok = true;
+          var c : u32 = 0u;
+          loop {
+            if (c >= sh.clipCount) { break; }
+            let cid = refs[ sh.clipStart + c ];
+            let cp  = clips[cid];
+            let cIn = inside_by_rule(cp.vStart, cp.vCount, cp.rule, fx, fy);
+            if (!cIn) { ok=false; break; }
+            c = c + 1u;
+          }
+
+          if (ok) {
+            var m = 1.0;
+            if (sh.maskCount > 0u) {
+              m = 0.0;
+              var mi : u32 = 0u;
+              loop {
+                if (mi >= sh.maskCount) { break; }
+                let mid = refs[ sh.maskStart + mi ];
+                let mp  = masks[mid];
+                let inM = inside_by_rule(mp.vStart, mp.vCount, mp.rule, fx, fy);
+                if (inM) {
+                  m = m + (1.0 - m) * clamp(mp.alpha, 0.0, 1.0);
+                }
+                mi = mi + 1u;
+              }
+            }
+            let f = sh.opacity * m;
+            if (f > 0.000001) {
+              col = over(sh.color * f, col);
+            }
+          }
+        }
+        k = k + 1u;
+      }
+      accum = accum + col;
+      sx = sx + 1u;
+    }
+    sy = sy + 1u;
+  }
+
+  let avg = accum * invN;
+  let A = clamp(avg.a, 0.0, 1.0);
+  var rgb = vec3f(0.0);
+  if (A > 0.000001) {
+    rgb = clamp(avg.rgb / A, vec3f(0.0), vec3f(1.0));
+  }
+  textureStore(outputTex, vec2<i32>(i32(x), i32(y)), vec4f(rgb, A));
+}
+;
+
+  const WGSL_BLIT = /* wgsl */
+@group(0) @binding(0) var srcTex : texture_2d<f32>;
+@group(0) @binding(1) var samp   : sampler;
+
+struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex
+fn vs(@builtin(vertex_index) vid: u32) -> VSOut {
+  var p = array<vec2f,3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0)
+  );
+  var uv = array<vec2f,3>(
+    vec2f(0.0, 0.0),
+    vec2f(2.0, 0.0),
+    vec2f(0.0, 2.0)
+  );
+  var o:VSOut;
+  o.pos = vec4f(p[vid], 0.0, 1.0);
+  o.uv  = uv[vid];
+  return o;
+}
+
+@fragment
+fn fs(i:VSOut) -> @location(0) vec4f {
+  let c = textureSampleLevel(srcTex, samp, i.uv, 0.0);
+  return c;
+}
+;
+
+  async function initWebGPUIfNeeded(width, height){
+    if (!navigator.gpu) return null;
+    if (!gpuAdapter) gpuAdapter = await navigator.gpu.requestAdapter();
+    if (!gpuAdapter) return null;
+    if (!gpuDevice) gpuDevice = await gpuAdapter.requestDevice();
+    if (!gpuCtx) gpuCtx = cvGPU.getContext('webgpu');
+    gpuFormat = navigator.gpu.getPreferredCanvasFormat();
+    gpuCtx.configure({ device: gpuDevice, format: gpuFormat, alphaMode: 'premultiplied' });
+
+    if (!gpuPipelines){
+      const computeModule = gpuDevice.createShaderModule({ code: WGSL_COMPUTE });
+      const blitModule    = gpuDevice.createShaderModule({ code: WGSL_BLIT });
+
+      const computePipeline = gpuDevice.createComputePipeline({
+        layout: 'auto',
+        compute: { module: computeModule, entryPoint: 'main' }
+      });
+
+      const blitPipeline = gpuDevice.createRenderPipeline({
+        layout: 'auto',
+        vertex:   { module: blitModule, entryPoint: 'vs' },
+        fragment: { module: blitModule, entryPoint: 'fs', targets: [{ format: gpuFormat }] }
+      });
+
+      const sampler = gpuDevice.createSampler({ magFilter:'nearest', minFilter:'nearest' });
+
+      gpuPipelines = { computePipeline, blitPipeline, sampler };
+    }
+
+    if (!gpuResources || gpuResources.width!==width || gpuResources.height!==height){
+      // recreate output texture & view
+      const outputTex = gpuDevice.createTexture({
+        size: { width, height },
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING
+      });
+      const outputView = outputTex.createView();
+      gpuResources = { width, height, outputTex, outputView };
+    }
+    return { device: gpuDevice, ctx: gpuCtx, pipelines: gpuPipelines, res: gpuResources, format: gpuFormat };
+  }
+
+  function createBufferFromArray(arr, usage){
+    const buf = gpuDevice.createBuffer({ size: (arr.byteLength+3)&~3, usage, mappedAtCreation: true });
+    const map = buf.getMappedRange(); new (arr.constructor)(map).set(arr); buf.unmap(); return buf;
+  }
+  // Ensure a TypedArray has at least minBytes (returns a possibly new zero-filled array of same ctor)
+  function ensureMinSize(arr, minBytes){
+    if (arr.byteLength >= minBytes) return arr;
+    const C = arr.constructor;
+    const count = Math.ceil(minBytes / C.BYTES_PER_ELEMENT);
+    return new C(count);
+  }
+
+  // ===============================
+  // DRAW (CPU or WebGPU) + animation timeline hooks
+  // ===============================
+  let renderInFlight = false;
+
+  async function draw(){
+    if (renderInFlight) return;
+    renderInFlight = true;
+    const frameStart = performance.now();
+
+    const tileSize=Number(tileInp.value);
+    const nWorkers=Number(workersInp.value);
+    const SS=Number(aaSel.value)|0;
+    const [W,H]=[cvCPU.width,cvCPU.height];
+
+    const t0=performance.now();
+    let scene=await buildSceneFromCode(codeEl.value);
+    if (!scene || scene.shapes.length===0) scene = fallbackScene();
+
+    const {tilesX,tilesY,tileCount,counts,offsets,tileShapeIndex}=binShapesIntoTiles(scene,tileSize, W, H);
+    const t1=performance.now();
+
+    // Report tiles
+    tTiles.textContent = ${tilesX}×${Math.ceil(H/tileSize)} = ${tilesX*Math.ceil(H/tileSize)};
+    tBuild.textContent=(t1-t0).toFixed(2)+' ms';
+
+    const want = rendererSel.value;
+    const hasGPU = !!navigator.gpu;
+    const useGPU = (want==='webgpu') || (want==='auto' && hasGPU);
+
+    if (useGPU){
+      const gpu = await initWebGPUIfNeeded(W,H);
+      if (!gpu){ console.warn('WebGPU unavailable, falling back to CPU.'); await drawCPU(scene, { tilesX, tileSize, counts, offsets, tileShapeIndex, SS, W, H, nWorkers }); }
+      else { cvGPU.style.display=''; cvCPU.style.display='none'; await drawWebGPU(scene, { tilesX, tileSize, counts, offsets, tileShapeIndex, SS, W, H }); }
+    } else {
+      cvGPU.style.display='none'; cvCPU.style.display='';
+      await drawCPU(scene, { tilesX, tileSize, counts, offsets, tileShapeIndex, SS, W, H, nWorkers });
+    }
+
+    const frameEnd = performance.now();
+    tFrameEl.textContent = (frameEnd - frameStart).toFixed(2)+' ms';
+    if (!isAnimating){
+      const instFPS = 1000 / Math.max(1, (frameEnd - frameStart));
+      fpsEl.textContent = instFPS.toFixed(1);
+    }
+    renderInFlight = false;
+  }
+
+  async function drawCPU(scene, info){
+    const { tilesX, tileSize, counts, offsets, tileShapeIndex, SS, W, H, nWorkers } = info;
+    ensureWorkerPool(nWorkers);
+
+    const tileIds=new Uint32Array(counts.length); for(let i=0;i<counts.length;i++) tileIds[i]=i;
+    const buckets=Array.from({length:nWorkers},()=>[]); for(let i=0;i<tileIds.length;i++) buckets[i%nWorkers].push(tileIds[i]);
+
+    const tR0=performance.now();
+    const jobs=buckets.map((tileIndices,wi)=>new Promise(resolve=>{
+      const w=cpuWorkers[wi];
+      w.onmessage=(e)=>{ if(e.data&&e.data.kind==='tilesDone') resolve(e.data.results); };
+      w.postMessage({
+        cmd:'renderTiles', tileSize, canvasW:W, canvasH:H, tilesX, tileIndices, offsets, counts, tileShapeIndex,
+        shapes: scene.shapes, clips: scene.clipPolys, clipRefs: scene.clipRefs, masks: scene.maskPolys, maskRefs: scene.maskRefs, SS
+      });
+    }));
+
+    const resultSets=await Promise.all(jobs);
+
+    ctx2D.clearRect(0,0,W,H);
+    for(const results of resultSets){
+      for(const r of results){
+        const img=new ImageData(r.pixels, r.tileW, r.tileH);
+        ctx2D.putImageData(img, r.tileX, r.tileY);
+      }
+    }
+    const tR1=performance.now();
+    tRaster.textContent=(tR1-tR0).toFixed(2)+' ms';
+  }
+
+  async function drawWebGPU(scene, info){
+    const { tilesX, tileSize, counts, offsets, tileShapeIndex, SS, W, H } = info;
+    const gpu = await initWebGPUIfNeeded(W,H); if (!gpu) return;
+    const { device, ctx, pipelines, res } = gpu;
+    const tR0 = performance.now();
+
+    // Pack vertices: shapes + clips + masks share one vertex buffer
+    let totalVerts = 0;
+    for (const s of scene.shapes) totalVerts += (s.verts.length>>>1);
+    for (const c of scene.clipPolys) totalVerts += (c.verts.length>>>1);
+    for (const m of scene.maskPolys) totalVerts += (m.verts.length>>>1);
+    const vBuf = new Float32Array(totalVerts*2);
+
+    // Create meta arrays
+    const shapeCount = scene.shapes.length;
+    const shapeMeta = new Float32Array(shapeCount * 16); // 16 f32 = 64 bytes per Shape
+    const shapeU32  = new Uint32Array(shapeMeta.buffer);
+
+    const clipCount = scene.clipPolys.length;
+    const clipMetaU32  = new Uint32Array(clipCount * 4);   // 4 u32 = 16 bytes per ClipPoly
+
+    const maskCount = scene.maskPolys.length;
+    const maskMetaF32  = new Float32Array(maskCount * 8);  // 8 f32 = 32 bytes per MaskPoly
+    const maskMetaU32  = new Uint32Array(maskMetaF32.buffer);
+
+    let vCursor = 0;
+
+    // Combined refs (clips first, then masks)
+    const maskBase = scene.clipRefs.length;
+    const combinedRefs = new Uint32Array(maskBase + scene.maskRefs.length);
+    combinedRefs.set(scene.clipRefs, 0);
+    combinedRefs.set(scene.maskRefs, maskBase);
+
+    // Shapes
+    for (let sIdx=0; sIdx<shapeCount; sIdx++){
+      const s = scene.shapes[sIdx];
+      const vCount = (s.verts.length>>>1);
+      const vStart = vCursor;
+      vBuf.set(s.verts, vCursor*2);
+      vCursor += vCount;
+
+      const baseU = sIdx*16;
+      shapeU32[baseU+0] = vStart;
+      shapeU32[baseU+1] = vCount;
+      shapeU32[baseU+2] = (s.rule==='nonzero') ? 1 : 0;
+      shapeU32[baseU+3] = 0;
+
+      const a = s.color[3]/255;
+      shapeMeta[baseU+4] = (s.color[0]/255)*a;
+      shapeMeta[baseU+5] = (s.color[1]/255)*a;
+      shapeMeta[baseU+6] = (s.color[2]/255)*a;
+      shapeMeta[baseU+7] = a;
+
+      shapeU32[baseU+8]  = s.clipStart>>>0;
+      shapeU32[baseU+9]  = s.clipCount>>>0;
+      shapeU32[baseU+10] = (s.maskStart + maskBase)>>>0;
+      shapeU32[baseU+11] = s.maskCount>>>0;
+
+      shapeMeta[baseU+12] = +s.opacity || 1.0;
+      shapeMeta[baseU+13] = 0;
+      shapeMeta[baseU+14] = 0;
+      shapeMeta[baseU+15] = 0;
+    }
+
+    // Clips (16 bytes each)
+    for (let i=0;i<clipCount;i++){
+      const c = scene.clipPolys[i];
+      const vCount = (c.verts.length>>>1);
+      const vStart = vCursor;
+      vBuf.set(c.verts, vCursor*2);
+      vCursor += vCount;
+
+      const base = i*4;
+      clipMetaU32[base+0] = vStart;
+      clipMetaU32[base+1] = vCount;
+      clipMetaU32[base+2] = (c.rule==='nonzero') ? 1 : 0;
+      clipMetaU32[base+3] = 0;
+    }
+
+    // Masks (32 bytes each incl. alpha)
+    for (let i=0;i<maskCount;i++){
+      const m = scene.maskPolys[i];
+      const vCount = (m.verts.length>>>1);
+      const vStart = vCursor;
+      vBuf.set(m.verts, vCursor*2);
+      vCursor += vCount;
+
+      const base = i*8;
+      maskMetaU32[base+0] = vStart;
+      maskMetaU32[base+1] = vCount;
+      maskMetaU32[base+2] = (m.rule==='nonzero') ? 1 : 0;
+      maskMetaU32[base+3] = 0;
+      maskMetaF32[base+4] = Math.max(0, Math.min(1, +m.alpha || 1.0));
+      maskMetaF32[base+5] = 0; maskMetaF32[base+6] = 0; maskMetaF32[base+7] = 0;
+    }
+
+    const uUniform = new Uint32Array([ W, H, tileSize, tilesX, SS, 0,0,0 ]);
+
+    // Combine offsets+counts into one buffer to keep STORAGE_BUFFERS ≤ 8
+    const tileOC = new Uint32Array(offsets.length * 2);
+    for (let i=0;i<offsets.length;i++){ tileOC[i*2] = offsets[i]; tileOC[i*2+1] = counts[i]; }
+
+    // Create/upload GPU buffers (pad empty storages to minBindingSize)
+    const bUniform       = createBufferFromArray(uUniform, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const bShapes        = createBufferFromArray(shapeMeta, GPUBufferUsage.STORAGE);
+    const bVertices      = createBufferFromArray(vBuf, GPUBufferUsage.STORAGE);
+    const bTileOC        = createBufferFromArray(tileOC, GPUBufferUsage.STORAGE);
+    const bTileShapeIx   = createBufferFromArray(ensureMinSize(tileShapeIndex, 4), GPUBufferUsage.STORAGE);
+    const bClips         = createBufferFromArray(ensureMinSize(clipMetaU32, 16), GPUBufferUsage.STORAGE);
+    const bMasks         = createBufferFromArray(ensureMinSize(maskMetaF32, 32), GPUBufferUsage.STORAGE);
+    const bRefs          = createBufferFromArray(ensureMinSize(combinedRefs, 4), GPUBufferUsage.STORAGE);
+
+    const bind0 = device.createBindGroup({
+      layout: pipelines.computePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding:0, resource:{ buffer:bUniform } },
+        { binding:1, resource:{ buffer:bShapes } },
+        { binding:2, resource:{ buffer:bVertices } },
+        { binding:3, resource:{ buffer:bTileOC } },
+        { binding:4, resource:{ buffer:bTileShapeIx } },
+        { binding:5, resource:{ buffer:bClips } },
+        { binding:6, resource:{ buffer:bMasks } },
+        { binding:7, resource:{ buffer:bRefs } },
+        { binding:8, resource: gpuResources.outputView }
+      ]
+    });
+
+    // Compute pass
+    const encoder = device.createCommandEncoder();
+    const cpass   = encoder.beginComputePass();
+    cpass.setPipeline(pipelines.computePipeline);
+    cpass.setBindGroup(0, bind0);
+    const wgSize = 8;
+    cpass.dispatchWorkgroups(Math.ceil(W/wgSize), Math.ceil(H/wgSize));
+    cpass.end();
+
+    // Blit pass
+    const view = ctx.getCurrentTexture().createView();
+    const rpass = encoder.beginRenderPass({
+      colorAttachments: [{ view, loadOp:'clear', clearValue:{r:0,g:0,b:0,a:1}, storeOp:'store' }]
+    });
+    const blitBG = device.createBindGroup({
+      layout: pipelines.blitPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding:0, resource: gpuResources.outputView },
+        { binding:1, resource: pipelines.sampler }
+      ]
+    });
+    rpass.setPipeline(pipelines.blitPipeline);
+    rpass.setBindGroup(0, blitBG);
+    rpass.draw(3,1,0,0);
+    rpass.end();
+
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    const tR1 = performance.now();
+    tRaster.textContent=(tR1-tR0).toFixed(2)+' ms';
+  }
+
+  // ===============================
+  // INIT
+  // ===============================
+  function initialSize(){
+    const [w,h]=sizeSel.value.split('x').map(Number);
+    setCanvasSize(w,h);
+    selectCanvasForRenderer();
+  }
+  initialSize();
+  randomizeLines();
+  draw();
+})();
+</script>
+</body>
+</html>
+ChatGPT said:
+
+Thought for 9m 29s
+Short answer: yes—you can do the same compute‑shader vector rasterization in .NET/C# and show it inside an Avalonia app. There are two practical routes:
+1) Cross‑platform, reuse your WGSL as‑is → WebGPU from .NET
+Use a native WebGPU binding for .NET, then run your WGSL compute + full‑screen blit exactly like in your browser demo.
+Binding: Silk.NET.WebGPU (active, native wgpu bindings; supports Windows/Vulkan/Metal backends through wgpu) 
+NuGet
+Note on Evergine/WebGPU.NET: the Evergine binding switched to browser‑only support as of June 30, 2025, so it’s no longer suitable for a native Avalonia desktop target. Use Silk.NET for native apps. 
+GitHub
+Important: swapchain (surface) images can’t be written from a compute shader; write to a storage texture, then sample/blit in a render pass. 
+Stack Overflow
++1
+How it maps to your JS code
+JS/WebGPU piece	.NET/WebGPU (Silk.NET)
+navigator.gpu.requestAdapter/device	api.InstanceRequestAdapter / AdapterRequestDevice
+GPUShaderModule(WGSL_COMPUTE/WGSL_BLIT)	device.CreateShaderModule with the same WGSL strings
+Storage buffers (shapes/vertices/tiles/refs)	CreateBuffer with `BufferUsage.Storage
+Storage texture rgba8unorm	CreateTexture with `TextureUsage.StorageBinding
+Compute pass → SSAA & coverage	BeginComputePass / DispatchWorkgroups (same workgroup size)
+Full‑screen blit	Render pass sampling the storage texture and writing to a surface or offscreen color target
+Present in Avalonia	Easiest: copy the GPU texture to a CPU readback buffer and fill an Avalonia.Media.Imaging.WriteableBitmap (see below). Later: present directly to a WebGPU Surface bound to a native handle
+Minimal “wire‑up” (outline)
+This shows the key pieces—type names follow Silk.NET.WebGPU; elided for brevity.
+// NuGet: Silk.NET.WebGPU.Native.WGPU
+using Silk.NET.WebGPU;
+using static Silk.NET.WebGPU.WebGPU; // helper for enums
+
+sealed class WgpuVectorRenderer : IDisposable
+{
+    WebGPU api = WebGPU.GetApi();
+    Instance* instance;
+    Adapter* adapter;
+    Device* device;
+    Queue* queue;
+
+    Texture* outputTex;
+    TextureView* outputView;
+    Buffer*  readback;          // for CPU copy
+    ComputePipeline* compute;
+    RenderPipeline*  blit;
+    BindGroup*       computeBG;
+    BindGroup*       blitBG;
+
+    uint width, height;
+
+    public WgpuVectorRenderer(uint w, uint h)
+    {
+        width = w; height = h;
+
+        // 1) Instance/adapter/device
+        instance = api.CreateInstance(new InstanceDescriptor());
+        adapter  = RequestAdapter(instance /* + powerPreference etc. */);
+        device   = RequestDevice(adapter);
+        queue    = api.DeviceGetQueue(device);
+
+        // 2) Create shaders (exact same WGSL from your demo)
+        ShaderModule* cs = CreateShader(device, WgslSources.Compute);  // string with WGSL_COMPUTE
+        ShaderModule* fsq= CreateShader(device, WgslSources.Blit);     // string with WGSL_BLIT
+
+        // 3) Pipelines
+        compute = CreateComputePipeline(device, cs, "main");
+        blit    = CreateFullscreenBlitPipeline(device, fsq, TextureFormat.Rgba8Unorm);
+
+        // 4) Output storage texture + view + readback buffer
+        outputTex  = api.DeviceCreateTexture(device, new TextureDescriptor {
+            Size = new Extent3D(width, height, 1),
+            Format = TextureFormat.Rgba8Unorm,
+            Usage  = TextureUsage.TextureBinding | TextureUsage.StorageBinding | TextureUsage.CopySrc
+        });
+        outputView = api.TextureCreateView(outputTex, null);
+
+        uint rowPitch = ((width * 4u + 255u) & ~255u); // 256‑B aligned for copies
+        readback = api.DeviceCreateBuffer(device, new BufferDescriptor {
+            Usage = BufferUsage.MapRead | BufferUsage.CopyDst,
+            Size  = (nuint)(rowPitch * height)
+        });
+
+        // 5) Upload your scene buffers (shapes, vertices, tiles, refs, uniforms)
+        //    Match the exact packing used in your JS (u32/f32 arrays).
+        var (bShapes, bVerts, bTileOC, bTileIx, bClips, bMasks, bRefs, bUniforms) = UploadScene();
+
+        // 6) Bind groups
+        computeBG = BuildComputeBindGroup(device, compute, outputView,
+                                          bUniforms, bShapes, bVerts, bTileOC, bTileIx, bClips, bMasks, bRefs);
+        blitBG    = BuildBlitBindGroup(device, blit, outputView);
+    }
+
+    public unsafe void RenderOnceAndReadback(Span<byte> dstRgba)
+    {
+        CommandEncoder* enc = api.DeviceCreateCommandEncoder(device, null);
+
+        // Compute pass
+        {
+            ComputePassEncoder* c = api.CommandEncoderBeginComputePass(enc, null);
+            api.ComputePassEncoderSetPipeline(c, compute);
+            api.ComputePassEncoderSetBindGroup(c, 0, computeBG, 0, null);
+            const uint WG = 8;
+            api.ComputePassEncoderDispatchWorkgroups(c,
+                (width  + WG - 1) / WG,
+                (height + WG - 1) / WG,
+                1);
+            api.ComputePassEncoderEnd(c);
+        }
+
+        // Copy storage texture -> readback buffer
+        {
+            uint rowPitch = ((width * 4u + 255u) & ~255u);
+            api.CommandEncoderCopyTextureToBuffer(enc,
+                new ImageCopyTexture { Texture = outputTex },
+                new ImageCopyBuffer {
+                    Buffer = readback,
+                    Layout = new TextureDataLayout {
+                        BytesPerRow  = rowPitch,
+                        RowsPerImage = height
+                    }
+                },
+                new Extent3D(width, height, 1)
+            );
+        }
+
+        CommandBuffer* cb = api.CommandEncoderFinish(enc, null);
+        api.QueueSubmit(queue, 1, &cb);
+
+        // Map and copy out row‑by‑row
+        MapAndCopyReadbackTo(dstRgba);
+    }
+
+    public void Dispose() { /* destroy WGPU resources */ }
+}
+The compute and blit WGSL can be copied straight from your page (your tiling, clip/mask, SSAA, premultiplication, etc.). The one semantic change you may want for Avalonia is output format—see “Pixel formats in Avalonia” below.
+2) Windows‑only, small codebase → ComputeSharp (C#→HLSL, D3D12)
+If you only target Windows, ComputeSharp lets you write the compute shader in C# and run it on DirectX 12. You’d port the WGSL kernel to HLSL/C# once, keep the same buffers and per‑pixel logic, and render into a ReadWriteTexture2D<Rgba32, float4>. It’s a much shorter host‑side code path. (ComputeSharp runs DX12 and falls back to WARP when no GPU is available.) 
+NuGet
++1
+Trade‑off: you don’t reuse WGSL verbatim and you’re limited to Windows/DX12.
+Minimal ComputeSharp kernel sketch:
+// NuGet: ComputeSharp
+using ComputeSharp;
+
+[ThreadGroupSize(8, 8)]
+[GeneratedComputeShaderDescriptor]
+public readonly partial struct VectorRasterizer(
+    ReadWriteTexture2D<Rgba32, float4> target,
+    ReadOnlyBuffer<Shape>  shapes,
+    ReadOnlyBuffer<float2> vertices,
+    ReadOnlyBuffer<uint>   tileOC,
+    ReadOnlyBuffer<uint>   tileShapeIx,
+    ReadOnlyBuffer<Clip>   clips,
+    ReadOnlyBuffer<Mask>   masks,
+    ReadOnlyBuffer<uint>   refs,
+    uint canvasW, uint canvasH, uint tileSize, uint tilesX, uint SS) : IComputeShader
+{
+    public void Execute()
+    {
+        uint2 p = new(ThreadIds.X, ThreadIds.Y);
+        if (p.X >= canvasW || p.Y >= canvasH) return;
+
+        // Supersample loop (same logic you have in WGSL):
+        float4 accum = 0;
+        for (uint sy = 0; sy < SS; sy++)
+        for (uint sx = 0; sx < SS; sx++)
+        {
+            float2 fp = new(p.X + (sx + 0.5f)/SS, p.Y + (sy + 0.5f)/SS);
+            float4 col = 0;
+
+            // Lookup tile → iterate shapes → inside_by_rule → clip/mask union → over()
+            // (port your point_in_evenodd / nonzero and blending exactly)
+            // col = Over(premulColor * (opacity * mask), col);
+
+            accum += col;
+        }
+
+        float4 avg = accum / (SS*SS);
+        float a = Hlsl.Saturate(avg.W);
+        float3 rgb = a > 1e-6f ? Hlsl.Saturate(avg.XYZ / a) : 0;
+        target[p] = new Rgba32(rgb, a); // straight alpha; see note below
+    }
+}
+Dispatching is one line: GraphicsDevice.GetDefault().For(width, height, new VectorRasterizer(...)). 
+GitHub
+Integrating with Avalonia
+You have two ways to present the GPU result in an Avalonia control.
+A. Simple & portable today → copy into a WriteableBitmap
+This works with either WebGPU (copy texture→buffer→CPU) or ComputeSharp (copy texture→CPU). Use WriteableBitmap.Lock() to get an ILockedFramebuffer and copy rows into it, then draw the bitmap in your control. 
+api-docs.avaloniaui.net
++1
+public sealed class GpuCanvas : Control, IDisposable
+{
+    readonly int _w, _h;
+    WriteableBitmap _wb;
+    byte[] _scratch;
+    WgpuVectorRenderer _gpu; // or ComputeSharp renderer
+    DispatcherTimer _timer;
+
+    public GpuCanvas(int w, int h)
+    {
+        _w = w; _h = h;
+        _wb = new WriteableBitmap(
+              new PixelSize(_w, _h),
+              new Vector(96,96),
+              PixelFormats.Rgba8888,   // match what you copy
+              AlphaFormat.Unpremul);   // or Premul—see note below
+        _scratch = new byte[_w * _h * 4];
+
+        _gpu = new WgpuVectorRenderer((uint)_w, (uint)_h);
+        _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        _timer.Tick += (_, __) =>
+        {
+            _gpu.RenderOnceAndReadback(_scratch);
+
+            using var fb = _wb.Lock();
+            // Copy row‑by‑row (stride can differ)
+            int srcStride = _w * 4, dstStride = fb.RowBytes;
+            unsafe
+            {
+                fixed (byte* src = _scratch)
+                {
+                    for (int y = 0; y < _h; y++)
+                        Buffer.MemoryCopy(src + y*srcStride, (fb.Address + y*dstStride).ToPointer(), dstStride, srcStride);
+                }
+            }
+            InvalidateVisual();
+        };
+        _timer.Start();
+    }
+
+    public override void Render(DrawingContext ctx)
+        => ctx.DrawImage(_wb, new Rect(Bounds.Size));
+}
+Key APIs and docs: WriteableBitmap.Lock()/ILockedFramebuffer and pixel formats (Rgba8888/Bgra8888). 
+api-docs.avaloniaui.net
++3
+api-docs.avaloniaui.net
++3
+api-docs.avaloniaui.net
++3
+Perf note: 1920×1080 @ 4 bytes/pixel is ~8.3 MB/frame. Copying that at 60 fps is ~500 MB/s over PCIe + memory—usually fine for a proof‑of‑concept. If you need sustained high FPS, move to “B” below.
+B. Zero‑copy / direct present (advanced)
+Create a WebGPU Surface from the control’s native handle and render the blit pass directly into that surface every frame (no CPU copies). On Windows you’ll use the HWND; on Linux X11/Wayland; on macOS NSView. Avalonia exposes platform handles and also has an OpenGlControlBase when you want a dedicated GPU surface. (You can either host a child native surface or integrate via a GPU control.) 
+api-docs.avaloniaui.net
+Doing this with WebGPU requires platform‑specific surface descriptors; it’s the best path once you’re happy with the basic renderer.
+Pixel formats & alpha with Avalonia
+Avalonia’s WriteableBitmap supports multiple pixel formats; the most convenient for a raw copy is PixelFormats.Rgba8888 (or Bgra8888 if you output BGRA from the shader). You can choose AlphaFormat.Unpremul or Premul—just be consistent with what your shader writes. 
+api-docs.avaloniaui.net
++1
+ Your WGSL currently averages samples in premultiplied space then divides by A before storing (i.e., writes straight RGBA). For Avalonia, either:
+keep straight RGBA and construct the bitmap with AlphaFormat.Unpremul, or
+skip the rgb /= a step and store premultiplied RGBA; then use AlphaFormat.Premul. 
+GitHub
+Porting the CPU side (geometry → buffers)
+Your JS builds:
+shapes[] with: vertex start/count, rule, premul color, clip/mask ref ranges, opacity
+vertices[] : vec2f with all shape/clip/mask vertex data
+tileOC[] (per‑tile offset/count) and tileShapeIx[]
+clips[], masks[], refs[] (indices into clip/mask lists)
+Uniforms (canvasW,H,tileSize,tilesX,SS)
+Do the same in C#:
+Use exact packing as your WGSL structs (e.g., your Shape is 64 bytes: 16 × f32/u32) to avoid layout mismatches. Fill Span<float>/Span<uint> and upload to storage buffers.
+Keep the prefix‑scan/tiling on CPU just as you do in JS (your code ports 1:1).
+For text shaping, quickest cross‑platform option in .NET is to build paths with SkiaSharp or HarfBuzzSharp and then flatten to polylines before packing (or port your JS flattener).
+Which route should you pick?
+Want cross‑platform and to reuse your WGSL verbatim? → Go with Silk.NET.WebGPU and start with the WriteableBitmap path. Then move to a native surface when you want zero‑copy. 
+NuGet
+Windows‑only, minimal host code, shader in C#? → Use ComputeSharp; port the kernel once to HLSL/C#. It’s very productive and still fast. 
+GitHub
+Extra references you might find handy
+Silk.NET WebGPU package page (bindings, examples link). 
+NuGet
+ComputeSharp overview & getting started (DX12, C# shaders). 
+NuGet
++1
+Compute can’t write swapchain images directly—blit via a render pass. 
+Stack Overflow
++1
+Avalonia: OpenGlControlBase (GPU custom control) and WriteableBitmap/ILockedFramebuffer APIs. 
+api-docs.avaloniaui.net
++2
+api-docs.avaloniaui.net
++2
+TL;DR blueprint
+Keep your WGSL compute & blit shaders unchanged.
+Pack buffers in C# exactly like your JS.
+Dispatch via Silk.NET.WebGPU.
+Show in Avalonia: start by copying into a WriteableBitmap each frame; later switch to a native WebGPU surface.
+If you want, I can turn the outline above into a small, self‑contained sample that renders your star + stroke demo into an Avalonia control using WebGPU + WriteableBitmap (with the buffer/packing code mirrored from your JS).
+You said:
+Can we also do full api support in C# like in javascript.
+
+Can we integrate silk wgpu into skiasharp gpu texture pipeline ?
+ChatGPT said:
+
+Thought for 19m 55s
+Short answer
+Yes—you can expose the same path/text/clip/opacity API in C# that you have in JS.
+Silk.NET.WebGPU ↔ SkiaSharp: today there are three workable integration levels:
+Copy to CPU → SkiaSharp (simple, portable).
+Zero‑copy via Vulkan/Metal/D3D (use SkiaSharp’s GPU backends and share a native texture that you create; skip WebGPU). 
+Skia
++1
+Zero‑copy with WebGPU/Dawn + Skia Graphite (requires a tiny native shim that wraps a WGPUTexture into Skia Graphite’s Dawn backend; doable, but not exposed by SkiaSharp out‑of‑the‑box). 
+skia.googlesource.com
++1
+Below I lay out a concrete .NET API shape, then the three integration routes with exact hooks and references.
+A. Mirroring your JS API in C#
+You can provide a nearly 1:1 surface so your scene‑building code ports with minimal edits.
+public sealed class VectorApi
+{
+    // Canvas + params
+    public int Width  { get; }
+    public int Height { get; }
+    public string FillRule => _fillRule;    // "evenodd" | "nonzero"
+    public T? Param<T>(string name) => _paramProvider(name);
+
+    // Colors / path building
+    public Rgba32 Color(byte r, byte g, byte b, byte a) => new(r,g,b,a);
+    public PathBuilder Path() => new();
+    public float2[] Star(float cx,float cy,float ro,float ri,int n=5) => Geometry.Star(cx,cy,ro,ri,n);
+    public float2[] RandomPolyline(int n) => _rng.RandomPolyline(n, Width, Height);
+
+    // Text
+    public Task<FontHandle> LoadFontAsync(string ttfPathOrUrl);
+    public PathBuilder TextPath(FontHandle font, string text, float x, float y, float size, TextOpts? opts=null);
+    public void FillText  (FontHandle f, string text, float x, float y, float size, Rgba32 color, TextOpts? opts=null);
+    public void StrokeText(FontHandle f, string text, float x, float y, float size, float width, Rgba32 color, StrokeStyle? s=null);
+
+    // Fill / stroke
+    public void FillPath(PathBuilder p, Rgba32 color, string? rule=null);
+    public void StrokePath(PathBuilder p, float width, Rgba32 color, StrokeStyle? style=null);
+
+    // SVG helpers
+    public PathBuilder SvgPath(string d);
+    public void FillSvg(string d, Rgba32 color, string? rule=null);
+    public void StrokeSvg(string d, float width, Rgba32 color, StrokeStyle? style=null);
+
+    // Animation/time
+    public double Time()  => _timeSeconds;
+    public double Dt()    => _dtSeconds;
+    public int Frame()    => _frame;
+
+    // Clip / opacity stacks
+    public void PushClip(PathBuilder p, string? rule=null);
+    public void PopClip();
+    public Task WithClip(PathBuilder p, Func<Task> draw, string? rule=null);
+
+    public void PushOpacity(float a);
+    public void PopOpacity();
+
+    public void PushOpacityMask(PathBuilder p, float alpha=1f, string? rule=null);
+    public void PopOpacityMask();
+    public Task WithOpacityMask(PathBuilder p, float alpha, Func<Task> draw, string? rule=null);
+}
+Keep your packing identical to WGSL: e.g., Shape = 64 bytes (16 × f32/u32), clip/mask headers, shared vertices: vec2f[], tileOC, tileShapeIx, and u32 refs. This avoids shader/layout mismatches.
+Use [StructLayout(LayoutKind.Sequential, Pack = 4)] and explicit field types (uint, float) to mirror your WGSL structs.
+Reuse your JS flatteners (De Casteljau for curves, ellipse discretization) in C# (System.Numerics) to emit float2 streams.
+Text: shape with HarfBuzzSharp (for kerning/ligatures) and outline via SkiaSharp or FreeType to contours → feed into your stroker/fill (just like your JS).
+Binning / prefix‑scan → identical CPU code; upload buffers to GPU (Silk.NET.WebGPU or ComputeSharp/D3D12).
+If you want, I can drop in fully fleshed C# structs for Shape/Clip/Mask/Uniforms and the path flattener; they’re a direct mechanical translation of your JS.
+B. Getting your WebGPU output into Avalonia + SkiaSharp
+Option 1 — Simple & robust today: copy pixels to CPU, then draw with SkiaSharp
+Render with WebGPU (Silk.NET.WebGPU) to a storage rgba8unorm texture.
+Copy to a readback buffer (rows 256‑byte aligned).
+Create/update SKBitmap/SKImage from the CPU bytes; draw in your SKCanvas (Avalonia uses Skia under the hood).
+This is trivial and cross‑platform, but it’s a CPU copy each frame.
+Option 2 — Zero‑copy today: use Vulkan/Metal/D3D directly (not WebGPU)
+If you can switch compute from WebGPU to a native backend, you can share GPU textures directly with SkiaSharp:
+Vulkan: Create your VkImage/memory and wrap it as SkiaSharp GRBackendTexture using GRVkImageInfo → get an SKSurface backed by your image. This path is supported now. 
+Skia
++1
+Metal: wrap an existing MTLTexture via Skia’s Metal backend (SkiaSharp has Metal bindings).
+D3D: Skia Graphite has D3D12; SkiaSharp’s D3D support has open tracking (still not first‑class in releases). 
+GitHub
+Vulkan wrap sketch (zero‑copy):
+// You create VkImage + VkDeviceMemory with proper usage (SAMPLED|STORAGE|TRANSFER_SRC)
+// Then wrap for Skia:
+var vkInfo = new GRVkImageInfo(
+    image: myVkImage,
+    alloc: new GRVkAlloc(myDeviceMemory, /*offset*/0, /*size*/memSize, /*flags*/0),
+    tiling: VkImageTiling.Optimal,
+    format: VkFormat.R8G8B8A8Unorm,
+    levelCount: 1,
+    currentQueueFamily: VkQueueFamilyIgnored, // or EXTERNAL/FOREIGN
+    protectedMemory: false,
+    ycbcrConversionInfo: default);
+
+using var backendTex = new GRBackendTexture(width, height, vkInfo);
+using var skSurface  = SKSurface.Create(
+    grContext,           // GRContext.CreateVulkan(...)
+    backendTex,
+    GRSurfaceOrigin.TopLeft,
+    SKColorType.Rgba8888,
+    null, null);
+Skia’s Vulkan docs describe this wrap/import model and lifetime rules. 
+Skia
+Why this works: you and SkiaSharp are talking to the same backend (Vk/MTL/D3D). You can insert proper barriers/queue‑ownership transfers and avoid any CPU staging.
+Option 3 — Zero‑copy with WebGPU (Graphite+Dawn) — feasible, but needs a tiny native shim
+Skia’s Graphite backend supports Dawn/WebGPU and can wrap a wgpu::Texture / WGPUTextureView into a Graphite BackendTexture. That’s exactly what you need to feed your WebGPU texture into Skia without copies:
+DawnTexture::MakeWrapped(..., wgpu::Texture) and
+BackendTextures::MakeDawn(dim, DawnTextureInfo, wgpu::TextureView) (Graphite). 
+skia.googlesource.com
++1
+Graphite in Chrome is built on Dawn (Google’s native WebGPU impl), so this path is well‑traveled. 
+Chromium Blog
+But: SkiaSharp (the managed .NET bindings) hasn’t publicly exposed Graphite/Dawn yet (the repo still references older milestones and there’s only community discussion around WebGPU). You can still do it by adding a slim C++/PInvoke layer: C++ (conceptual):
+// skia-bridge.cpp  (build Skia with Graphite + Dawn enabled)
+extern "C" __declspec(dllexport)
+SkSurface* SkiaGraphite_WrapWgpuTexture(WGPUDevice dev, WGPUTexture tex,
+                                        int width, int height, WGPUTextureFormat fmt)
+{
+    skgpu::graphite::DawnBackendContext be;
+    be.fDevice = wgpu::Device::Acquire(dev); // borrow Dawn device
+
+    auto ctx = skgpu::graphite::Context::MakeDawn(be);
+    auto rec = ctx->makeRecorder(skgpu::graphite::RecorderOptions{});
+
+    skgpu::graphite::DawnTextureInfo info;
+    info.fFormat      = static_cast<wgpu::TextureFormat>(fmt);
+    info.fUsage       = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment;
+    info.fMipmapped   = skgpu::Mipmapped::kNo;
+    info.fSampleCount = 1;
+
+    auto view = wgpu::Texture(tex).CreateView();
+    auto beTex = skgpu::graphite::BackendTextures::MakeDawn({width,height}, info, view.Get());
+
+    auto surface = SkSurfaces::WrapBackendTexture(rec.get(), beTex,
+                    kTopLeft_GrSurfaceOrigin, /*samples*/1,
+                    kRGBA_8888_SkColorType, /*colorspace*/nullptr, /*props*/nullptr);
+
+    // ... stash ctx/rec on a holder to manage lifetime & submission ...
+    return surface.release();
+}
+Those MakeWrapped/MakeDawn entry points exist in Graphite’s Dawn backend. 
+skia.googlesource.com
++2
+skia.googlesource.com
++2
+ From C#, you’d pass WGPUDevice/WGPUTexture handles obtained via Silk.NET.WebGPU to this function (P/Invoke). Now you can draw Skia content over (or sample from) the same texture that your compute shader wrote—no copies. Caveats
+You’re living in native Skia Graphite land for this step; SkiaSharp doesn’t currently expose these Dawn/Graphite wrappers. (There are open/older discussions; Graphite is the new Skia backend, Dawn support is in Graphite; Ganesh’s Dawn backend was removed.) 
+skia.googlesource.com
++1
+You must synchronize GPU work (submit/flush on both sides) and respect Dawn/Graphite rules for texture usage and lifetime.
+C. Which path should you pick?
+Need results now, cross‑platform, minimal code: Option 1 (CPU copy).
+Highest perf today with SkiaSharp: Option 2 (target a native backend—Vulkan/Metal—instead of wgpu). SkiaSharp already knows how to wrap those textures. 
+Skia
+Want to keep WebGPU/WGSL and still be zero‑copy: Option 3 with a small C++ bridge to Skia Graphite’s Dawn backend. Graphite explicitly supports Dawn, and can wrap wgpu::Texture/View. 
+Chromium Blog
++2
+skia.googlesource.com
++2
+D. Notes & gotchas
+SkiaSharp backends: today it exposes Ganesh backends (GL, Vulkan, Metal); D3D/Graphite/WebGPU exposure in SkiaSharp is not generally available yet (issue history shows D3D interest). 
+GitHub
+Skia + compute: Skia doesn’t expose a public compute‑shader API; keep compute in your pipeline, then hand Skia a texture. 
+Google Groups
+Row pitch: WebGPU buffer copies require 256‑byte row alignment—account for it when blitting to CPU or into Skia. (Standard WebGPU rule.) 
+issues.chromium.org
+Alpha: Your WGSL averages SSAA and then divides by A (straight alpha). Skia often prefers premultiplied; be consistent when you wrap/interpret the texture in Skia.
+Synchronization: For Vulkan/Metal wraps, follow Skia’s rules (GrVkImageInfo queue‑family ownership/transition, etc.). 
+kyamagu.github.io
++1
+E. Example “full‑API” usage in C# (very close to your JS)
+var api = new VectorApi(width, height);
+
+// 1) Fill star
+api.FillPath(
+    api.Path().Poly(api.Star(0.5f*W, 0.35f*H, 0.26f*k, 0.11f*k, 7)).ClosePath(),
+    api.Color(88,156,255,220),
+    api.FillRule);
+
+// 2) Stroke random polyline with UI params
+api.StrokePath(
+    api.Path().Poly(api.RandomPolyline(220)),
+    strokeWidth: ui.StrokeWidth,
+    color: api.Color(250,245,140,255),
+    new StrokeStyle { Join = ui.Join, Cap = ui.Cap, MiterLimit = ui.Miter });
+
+api.PushOpacityMask(api.TextPath(font, "MASK", 0.5f*W, 0.55f*H, 160, new(){Align=TextAlign.Center}), 0.85f);
+   // ... draw masked content ...
+api.PopOpacityMask();
+Under the hood this records shapes + stacks → packs buffers → dispatches your same WGSL (Silk.NET.WebGPU) or a ComputeSharp HLSL if you choose D3D12.
+References
+Skia Graphite uses Dawn (WebGPU) in Chrome. 
+Chromium Blog
+Graphite/Dawn can wrap a wgpu::Texture/TextureView (zero‑copy interop): DawnTexture::MakeWrapped and BackendTextures::MakeDawn(...). 
+skia.googlesource.com
++1
+SkiaSharp Vulkan texture wrapping (use GRVkImageInfo → GRBackendTexture → SKSurface). 
+Skia
++1
+Skia public API doesn’t expose compute; keep compute in your pipeline. 
+Google Groups
+SkiaSharp & D3D12: not broadly available; tracked in repo discussions/issues. 
+GitHub
+Bottom line
+Full C# API parity is straightforward (I can provide drop‑in files for PathBuilder, flatteners, and the packed GPU structs).
+Silk.NET.WebGPU ↔ SkiaSharp:
+quickest: CPU copy;
+fastest today in SkiaSharp: use a native backend (Vulkan/Metal) instead of wgpu;
+or build a small native shim to let Graphite (Dawn) wrap your WGPUTexture for true zero‑copy WebGPU interop.
+You said:
+Please extend how the api in C# would work with compute shaders in silk and then gull GPU pipeline via skiasharp?
+ChatGPT said:
+
+Thought for 11m 56s
+Great—let’s make this concrete. Below I’ll show:
+How the C# API mirrors your JS API, then
+How the compute path runs with Silk.NET/WebGPU (using your existing WGSL), and finally
+How to feed the result through the SkiaSharp GPU pipeline today (copy bridge), plus what a zero‑copy path would look like when Graphite/WebGPU is exposed to .NET.
+Tooling/impl facts I’ll rely on: Silk.NET ships a first‑class WebGPU binding for .NET; Skia’s modern GPU backend (Graphite) has a Dawn/WebGPU backend in C++ (used by Chrome), and exposes C++ entry points to adopt a WebGPU device; SkiaSharp doesn’t yet expose those Graphite/Dawn hooks publicly, so the no‑copy interop needs a tiny native shim for now.
+1) C# API surface (1:1 with your JS)
+This is the authoring layer—paths, stroking, text, clip/opacity stacks—identical to your JS ergonomics. It builds a PackedScene that the GPU (or CPU fallback) consumes.
+// ---------------- “Authoring” layer ----------------
+public enum FillRule { EvenOdd, NonZero }
+
+public readonly record struct Rgba8(byte R, byte G, byte B, byte A)
+{
+    public System.Numerics.Vector4 ToPremulVec4()
+    {
+        var a = A / 255f;
+        return new(a > 0 ? (R / 255f) * a : 0f,
+                   a > 0 ? (G / 255f) * a : 0f,
+                   a > 0 ? (B / 255f) * a : 0f,
+                   a);
+    }
+}
+
+public sealed class VectorApi
+{
+    private readonly SceneBuilder _sb;
+    public int Width  { get; }
+    public int Height { get; }
+
+    public VectorApi(int w, int h) { Width = w; Height = h; _sb = new SceneBuilder(w, h); }
+
+    // Colors / helpers
+    public Rgba8 Color(byte r, byte g, byte b, byte a = 255) => new(r, g, b, a);
+    public PathBuilder Path() => new();
+    public float[] SvgToPathVerts(string d, float tol = 0.35f) => SvgParser.ToFlattened(d, tol);
+
+    public float[] Star(float cx, float cy, float rOuter, float rInner, int n) => Geometry.Star(cx, cy, rOuter, rInner, n);
+    public float[] RandomPolyline(int n) => Geometry.RandomPolyline(n, Width, Height);
+
+    // Fill/stroke
+    public void FillPath(PathBuilder p, Rgba8 color, FillRule rule = FillRule.EvenOdd) => _sb.Fill(p, color, rule);
+    public void StrokePath(PathBuilder p, float w, Rgba8 color, StrokeStyle s) => _sb.Stroke(p, w, color, s);
+
+    // Text (outline to Path; implementation can use HarfBuzzSharp + SharpFont or Skia)
+    public Task<IFont> LoadFontAsync(ReadOnlyMemory<byte> ttfOrUrl) => FontLoader.LoadAsync(ttfOrUrl);
+    public PathBuilder TextPath(IFont font, string text, float x, float y, float size, TextOptions opt) => TextOutliner.ToPath(font, text, x, y, size, opt);
+    public void FillText(IFont f, string s, float x, float y, float sz, Rgba8 c, TextOptions o) =>
+        FillPath(TextPath(f, s, x, y, sz, o), c, FillRule.EvenOdd);
+    public void StrokeText(IFont f, string s, float x, float y, float sz, float w, Rgba8 c, TextOptions o) =>
+        StrokePath(TextPath(f, s, x, y, sz, o), w, c, StrokeStyle.Round);
+
+    // Clip / opacity stacks
+    public void PushClip(PathBuilder p, FillRule r = FillRule.EvenOdd) => _sb.PushClip(p, r);
+    public void PopClip() => _sb.PopClip();
+    public void PushOpacity(float a) => _sb.PushOpacity(a);
+    public void PopOpacity() => _sb.PopOpacity();
+    public void PushOpacityMask(PathBuilder p, float a = 1f, FillRule r = FillRule.EvenOdd) => _sb.PushMask(p, a, r);
+    public void PopOpacityMask() => _sb.PopMask();
+
+    // Animation/time (you can set these from your host)
+    public double TimeSeconds  { get => _sb.TimeSeconds;  set => _sb.TimeSeconds = value; }
+    public double DeltaSeconds { get => _sb.DeltaSeconds; set => _sb.DeltaSeconds = value; }
+    public ulong  Frame        { get => _sb.Frame;        set => _sb.Frame = value; }
+
+    // Finalize
+    public PackedScene Build() => _sb.Pack();
+}
+Internally, SceneBuilder mirrors your JS: it flattens paths, runs your stroker (joins/caps/miter‑limit), records clip/mask/opacity stacks, then packs buffers with exact WGSL‑compatible layouts (see next section).
+2) Compute with Silk.NET.WebGPU (reusing your WGSL)
+We’ll keep your WGSL compute and blit shaders verbatim. The .NET runtime uploads buffers and dispatches.
+Binary layouts (match WGSL exactly)
+using System.Runtime.InteropServices;
+
+// 16 u32 totals in WGSL; we pack as 4-byte multiples (64 bytes total)
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+public struct ShapeGpu
+{
+    public uint VStart, VCount, Rule, _pad0;
+    public float CR, CG, CB, CA;              // premultiplied
+    public uint ClipStart, ClipCount, MaskStart, MaskCount;
+    public float Opacity, _pad1, _pad2, _pad3;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+public struct ClipGpu { public uint VStart, VCount, Rule, _pad0; } // 16 bytes
+
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+public struct MaskGpu { public uint VStart, VCount, Rule, _pad0; public float Alpha, _f1, _f2, _f3; } // 32 bytes
+
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+public struct UniformsGpu  // 8 u32 (32 bytes)
+{
+    public uint CanvasW, CanvasH, TileSize, TilesX, SS, _pa, _pb, _pc;
+}
+Renderer wiring (compute → storage texture → (optionally) blit → copy)
+// NuGet: Silk.NET.WebGPU.Native.WGPU
+using Silk.NET.WebGPU;
+using static Silk.NET.WebGPU.WebGPU;
+
+public sealed unsafe class WgpuRenderer : IDisposable
+{
+    readonly WebGPU _api = WebGPU.GetApi();               // Silk.NET entry
+    Instance* _instance;
+    Adapter*  _adapter;
+    Device*   _device;
+    Queue*    _queue;
+
+    // Pipelines & resources
+    ShaderModule* _cs, _fsq;
+    ComputePipeline* _compute;
+    RenderPipeline*  _blit;
+    BindGroupLayout* _computeBgl;
+    BindGroupLayout* _blitBgl;
+
+    Texture* _outputTex;
+    TextureView* _outputView;
+    Buffer* _readback;
+
+    uint _w, _h, _tile, _ss;
+    const uint WG = 8; // workgroup size in WGSL
+
+    public WgpuRenderer(uint w, uint h, uint tile, uint ss)
+    {
+        _w = w; _h = h; _tile = tile; _ss = ss;
+
+        // 1) Instance/adapter/device/queue
+        _instance = _api.CreateInstance(new InstanceDescriptor());
+        _adapter  = RequestAdapter(_api, _instance);
+        _device   = RequestDevice(_api, _adapter);
+        _queue    = _api.DeviceGetQueue(_device);
+
+        // 2) Shaders/pipelines (your WGSL strings)
+        _cs = CreateShader(_device, Shaders.WgslCompute); // WGSL_COMPUTE
+        _fsq= CreateShader(_device, Shaders.WgslBlit);    // WGSL_BLIT
+
+        _compute = CreateComputePipeline(_device, _cs, "main"); // layout=auto mirrors WGSL bindings
+        _blit    = CreateFullscreenBlitPipeline(_device, _fsq, TextureFormat.Rgba8Unorm);
+
+        // 3) Output storage texture & readback buffer
+        _outputTex = _api.DeviceCreateTexture(_device, new TextureDescriptor
+        {
+            Size   = new Extent3D(_w, _h, 1),
+            Format = TextureFormat.Rgba8Unorm,
+            Usage  = TextureUsage.StorageBinding | TextureUsage.TextureBinding | TextureUsage.CopySrc
+        });
+        _outputView = _api.TextureCreateView(_outputTex, null);
+
+        // WebGPU copy rows must be 256‑byte aligned; compute aligned rowBytes once. 
+        var rowBytesAligned = ((_w * 4u) + 255u) & ~255u;
+        _readback = _api.DeviceCreateBuffer(_device, new BufferDescriptor
+        {
+            Size  = (nuint)(rowBytesAligned * _h),
+            Usage = BufferUsage.MapRead | BufferUsage.CopyDst
+        });
+    }
+
+    public (Buffer* uniform, Buffer* shapes, Buffer* verts, Buffer* tileOC,
+            Buffer* tileIx, Buffer* clips, Buffer* masks, Buffer* refs)
+        Upload(PackedScene ps)
+    {
+        // Create and upload each storage/uniform buffer from ps.* arrays
+        var u = CreateBuffer(_device, ps.Uniforms, BufferUsage.Uniform | BufferUsage.CopyDst);
+        var s = CreateBuffer(_device, ps.Shapes,   BufferUsage.Storage | BufferUsage.CopyDst);
+        var v = CreateBuffer(_device, ps.Vertices, BufferUsage.Storage | BufferUsage.CopyDst);
+        var oc= CreateBuffer(_device, ps.TileOC,   BufferUsage.Storage | BufferUsage.CopyDst);
+        var ix= CreateBuffer(_device, ps.TileShapeIndex, BufferUsage.Storage | BufferUsage.CopyDst);
+        var c = CreateBuffer(_device, ps.Clips,    BufferUsage.Storage | BufferUsage.CopyDst);
+        var m = CreateBuffer(_device, ps.Masks,    BufferUsage.Storage | BufferUsage.CopyDst);
+        var r = CreateBuffer(_device, ps.Refs,     BufferUsage.Storage | BufferUsage.CopyDst);
+        return (u,s,v,oc,ix,c,m,r);
+    }
+
+    public void RenderAndCopyTo(Buffer* u, Buffer* s, Buffer* v, Buffer* oc,
+                                Buffer* ix, Buffer* c, Buffer* m, Buffer* r)
+    {
+        // 4) Bind group for compute
+        var bg = _api.DeviceCreateBindGroup(_device, new BindGroupDescriptor
+        {
+            Layout  = _api.ComputePipelineGetBindGroupLayout(_compute, 0),
+            Entries = new[]
+            {
+                new BindGroupEntry { Binding = 0, Buffer = u },
+                new BindGroupEntry { Binding = 1, Buffer = s },
+                new BindGroupEntry { Binding = 2, Buffer = v },
+                new BindGroupEntry { Binding = 3, Buffer = oc },
+                new BindGroupEntry { Binding = 4, Buffer = ix },
+                new BindGroupEntry { Binding = 5, Buffer = c },
+                new BindGroupEntry { Binding = 6, Buffer = m },
+                new BindGroupEntry { Binding = 7, Buffer = r },
+                new BindGroupEntry { Binding = 8, TextureView = _outputView }
+            }
+        });
+
+        // 5) Encode: compute pass + copy texture → readback buffer
+        var enc = _api.DeviceCreateCommandEncoder(_device, null);
+
+        var cpass = _api.CommandEncoderBeginComputePass(enc, null);
+        _api.ComputePassEncoderSetPipeline(cpass, _compute);
+        _api.ComputePassEncoderSetBindGroup(cpass, 0, bg, 0, null);
+        _api.ComputePassEncoderDispatchWorkgroups(cpass,
+            (_w + WG - 1) / WG, (_h + WG - 1) / WG, 1);
+        _api.ComputePassEncoderEnd(cpass);
+
+        var rowBytes = ((_w * 4u) + 255u) & ~255u; // 256‑byte multiple
+        _api.CommandEncoderCopyTextureToBuffer(enc,
+            new ImageCopyTexture { Texture = _outputTex },
+            new ImageCopyBuffer {
+                Buffer = _readback,
+                Layout = new TextureDataLayout { BytesPerRow = rowBytes, RowsPerImage = _h }
+            },
+            new Extent3D(_w, _h, 1)
+        );
+
+        var cb = _api.CommandEncoderFinish(enc, null);
+        _api.QueueSubmit(_queue, 1, &cb);
+
+        // (optional) if you want a GPU fullscreen blit instead of CPU copy:
+        // create a render pass that samples outputTex and draws a full‑screen triangle
+        // to a swapchain or offscreen render target (not needed for Skia bridge).
+    }
+
+    public (nint ptr, int rowBytes) MapReadback()
+    {
+        // Synchronously map for simplicity; production: async callback then fence.
+        _api.BufferMapAsync(_readback, MapMode.Read, 0, 0, null, null);
+        _api.DevicePoll(_device, true); // drive completion
+        var data = _api.BufferGetMappedRange(_readback, 0, 0);
+        return ((nint)data, (int)((_w * 4u + 255u) & ~255u));
+    }
+
+    public void UnmapReadback() => _api.BufferUnmap(_readback);
+
+    // ... helpers CreateShader, CreateBuffer, RequestAdapter, RequestDevice omitted for brevity ...
+    public void Dispose() { /* destroy WGPU resources */ }
+}
+This uses Silk.NET’s WebGPU binding; everything maps closely to WebGPU concepts you used in JS (device/queue/shader modules/pipelines/bind groups).
+3) Drive SkiaSharp’s GPU pipeline with the WebGPU result
+You have two integration modes:
+A) Works today, cross‑platform — “copy bridge” into Skia
+Run the compute pass and copy the storage texture into a readback buffer (above).
+Wrap that CPU memory into an SKImage and draw it on an SKCanvas.
+// After RenderAndCopyTo(...):
+var (ptr, rowBytes) = wgpu.MapReadback();
+
+// Your WGSL writes **straight** RGBA; upload as Unpremul image.
+// (If you choose to store premultiplied in WGSL, use Premul here.)
+var info = new SKImageInfo((int)width, (int)height,
+                           SKColorType.Rgba8888, SKAlphaType.Unpremul);  // upload semantics
+using var image = SKImage.FromPixels(info, ptr, rowBytes);
+
+// Draw inside your Skia render callback (SkiaSharp.Views control, or Avalonia’s Skia layer)
+canvas.DrawImage(image, 0, 0);   // now you’re fully in Skia’s GPU/paint pipeline
+wgpu.UnmapReadback();
+Skia accepts Unpremultiplied uploads (SKAlphaType.Unpremul) and will handle them appropriately; render targets themselves are premultiplied. Pick one convention and stay consistent. This path incurs one CPU copy per frame (~8.3 MB @ 1080p), which is often fine for UI/visualization. It gives you immediate composition with the rest of your Skia scene (text, effects, images, etc.), i.e., “full pipeline via Skia”.
+B) Zero‑copy (advanced) — Graphite + WebGPU device adoption (native shim)
+Skia’s Graphite backend includes a Dawn/WebGPU backend. In C++ you can create a Graphite context from an existing WebGPU device/queue via skgpu::graphite::ContextFactory::MakeDawn(const DawnBackendContext&), whose header pulls in the WebGPU C++ API (webgpu/webgpu_cpp.h). From there you can wrap WGPUTexture views into Graphite backend textures/surfaces and draw with Skia on the same device. SkiaSharp doesn’t currently expose these Graphite/Dawn hooks; you’d add a tiny C++ DLL that:
+accepts WGPUDevice/WGPUQueue/WGPUTextureView from your Silk/WebGPU side,
+constructs a Graphite Context/Recorder with Dawn backend,
+returns opaque handles to .NET (P/Invoke) for making SkSurface/SkImage from those backend textures.
+This is the cleanest no‑copy path once Graphite/WebGPU is exposed in your stack. (Graphite’s backend enum explicitly includes kDawn, i.e., WebGPU via Dawn. )
+Putting it all together (end‑to‑end sketch)
+// 1) Authoring
+var api = new VectorApi(1024, 768);
+var yellow = api.Color(250,245,140,255);
+var blue   = api.Color( 88,156,255,220);
+
+// Scene—mirror your JS
+api.FillPath(api.Path().Poly(api.Star(512, 300, 240, 100, 7)).ClosePath(), blue, FillRule.EvenOdd);
+api.StrokePath(api.Path().Poly(api.RandomPolyline(220)),
+               w: 10, yellow, new StrokeStyle("round", "round", 4f));
+// ... text, clips, masks ...
+var scene = api.Build();  // PackedScene with WGSL‑compatible buffers
+
+// 2) Compute with WebGPU
+using var wgpu = new WgpuRenderer((uint)api.Width, (uint)api.Height, tile:64, ss:2);
+var bufs = wgpu.Upload(scene);
+wgpu.RenderAndCopyTo(bufs.uniform, bufs.shapes, bufs.verts, bufs.tileOC,
+                     bufs.tileIx, bufs.clips, bufs.masks, bufs.refs);
+
+// 3) Present via Skia (copy bridge)
+var (ptr, rowBytes) = wgpu.MapReadback();
+var info = new SKImageInfo(api.Width, api.Height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
+using var img = SKImage.FromPixels(info, ptr, rowBytes);
+
+// -> In your Skia render:
+canvas.DrawImage(img, 0, 0);
+// ... draw more Skia content, effects, UI, etc.
+wgpu.UnmapReadback();
+That’s the flow you can ship today.
+Notes, tips, and gotchas
+Reuse your WGSL verbatim. All the tricky parts (SSAA, even‑odd/non‑zero filling, per‑shape clip/mask stacks, premul blending) stay in the compute shader—only the host code changes.
+Buffer packing: keep the exact 4‑byte packing you used in WGSL; in C# use [StructLayout(Pack = 4)] and store your “refs”/indices as uint.
+Row pitch: when copying textures to buffers in WebGPU, bytesPerRow must be a multiple of 256. Round your (width * 4) up to that alignment; your JS did this implicitly—mirror it in C#.
+Skia alpha conventions: render targets are premultiplied; uploads may be Unpremul—choose one convention for your compute output and match it when creating the SKImage.
+Zero‑copy later: when Graphite/WebGPU interop is available to .NET, use Graphite’s Dawn backend to adopt the device and wrap your WebGPU textures (the C++ headers and backend enum show the intended path).
+Why this is “full GPU pipeline via SkiaSharp”
+With the copy bridge, SkiaSharp receives an SKImage every frame and continues entirely on its GPU path for composition—filters, text, images, UI—exactly as in a typical Skia app. Your compute shader is just producing the source image efficiently on the GPU first. When you later switch to a Graphite+Dawn shim, even that one CPU hop disappears and the same SKImage/SKSurface will be backed by your WebGPU texture directly. If you want, I can turn the snippets above into a minimal solution (library + sample app) that compiles, including:
+PathBuilder, stroker, flattener, SVG parser (ported from your JS),
+the PackedScene packer,
+a WgpuRenderer that uploads and dispatches your WGSL, and
+a Skia view that draws the compute output.
+
+
+
+No file chosenNo file chosen
+ChatGPT can make mistakes. Check important info. See Cookie Preferences.

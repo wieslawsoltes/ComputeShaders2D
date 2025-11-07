@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="ComputeSharpVectorRenderer.Fallback.cs" />
+    <Compile Remove="ComputeSharpVectorRenderer.Windows.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(OS)'=='Windows_NT'">
+    <Compile Include="ComputeSharpVectorRenderer.Windows.cs" />
+    <PackageReference Include="ComputeSharp" Version="3.0.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(OS)'!='Windows_NT'">
+    <Compile Include="ComputeSharpVectorRenderer.Fallback.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ComputeShaders2D.Core\ComputeShaders2D.Core.csproj" />
+  </ItemGroup>
+</Project>
