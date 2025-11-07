@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prefix‑Sum CPU Renderer (AA + Round Joins/Caps, Parallel)</title>
+  <style>
+    :root { --bg:#0f1220; --panel:#12162b; --ink:#e7e9ef; --line:#232849; }
+    html,body { height:100%; margin:0; background:var(--bg); color:var(--ink);
+      font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,sans-serif; }
+    header { padding:12px 16px; background:#151934; position:sticky; top:0; z-index:5;
+      box-shadow:0 2px 8px rgba(0,0,0,.25); }
+    header h1 { margin:0; font-size:16px; font-weight:600; }
+    .row { display:grid; grid-template-columns:360px 1fr; gap:16px; padding:16px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; }
+    label { display:flex; align-items:center; gap:8px; margin:6px 0; }
+    input[type="range"] { width:100%; }
+    select, button { background:#2a3160; color:#fff; border:1px solid #3b4282;
+      border-radius:10px; padding:6px 8px; }
+    button { cursor:pointer; }
+    button:hover { filter:brightness(1.06); }
+    .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    .small { font-size:12px; opacity:.9; }
+    canvas { background:#0b0e1d; border:1px solid var(--line); border-radius:12px; width:100%; height:auto; image-rendering:pixelated; }
+    .row2 { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:8px; }
+    .stat { background:#0e1330; border:1px dashed #2e3569; border-radius:10px; padding:8px; text-align:center; }
+    dialog { border:1px solid #3b4282; border-radius:10px; background:#0b0e1d; color:#e7e9ef; max-width:680px; }
+    dialog::backdrop{ background: rgba(0,0,0,.45); }
+  </style>
+</head>
+<body>
+  <header><h1>Prefix‑Sum CPU Vector Renderer → AA + Round Joins/Caps (Web Workers)</h1></header>
+  <div class="row">
+    <div class="panel">
+      <div><strong>Scene controls</strong></div>
+      <label>Canvas Size
+        <select id="size">
+          <option value="800x600">800 × 600</option>
+          <option value="1024x768">1024 × 768</option>
+          <option value="1280x720">1280 × 720</option>
+          <option value="1920x1080">1920 × 1080</option>
+        </select>
+      </label>
+      <label>Tile Size (px)
+        <input id="tile" type="range" min="16" max="128" value="64" step="16" />
+        <span id="tileVal" class="mono small">64</span>
+      </label>
+      <label>Workers
+        <input id="workers" type="range" min="1" max="16" value="4" />
+        <span id="workersVal" class="mono small">4</span>
+      </label>
+      <label>Stroke Width
+        <input id="stroke" type="range" min="1" max="40" value="10" />
+        <span id="strokeVal" class="mono small">10</span>
+      </label>
+      <label>AA (supersample)
+        <select id="aa">
+          <option value="1">1× (off)</option>
+          <option value="2" selected>2×</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+      <div class="row2">
+        <button id="rerender">Render</button>
+        <button id="randomize">Randomize Lines</button>
+        <button id="toggleRule">Fill Rule: <span id="ruleTxt">evenodd</span></button>
+      </div>
+      <p class="small">
+        Pipeline: <span class="mono">count → exclusive‑scan → scatter</span> builds compact per‑tile lists.
+        Fills use per‑row <em>difference arrays + prefix sums</em>. Strokes are expanded with <strong>round joins</strong>
+        and <strong>round caps</strong> (triangle‑fan arcs). AA via <strong>SSAA</strong> (1×/2×/4×).
+      </p>
+      <div class="row2">
+        <div class="stat"><div class="small">Build</div><div class="mono" id="tBuild">–</div></div>
+        <div class="stat"><div class="small">Raster</div><div class="mono" id="tRaster">–</div></div>
+        <div class="stat"><div class="small">Tiles</div><div class="mono" id="tTiles">–</div></div>
+      </div>
+      <div style="margin-top:12px">
+        <strong>Path Builder Playground</strong>
+        <textarea id="code" class="mono" style="width:100%; height:280px; background:#0b0e1d; color:#cfe1ff; border:1px solid #2e3569; border-radius:8px; padding:8px;">
+// Build a scene with the Path Builder API.
+// Call the helpers on the `api` object.
+
+const W = api.width();
+const H = api.height();
+
+// 1) Filled star
+api.fillPath(
+  api.path()
+    .poly(api.star(W*0.5, H*0.45, Math.min(W,H)*0.28, Math.min(W,H)*0.12, 7))
+    .closePath(),
+  api.color(88,156,255,220),
+  api.rule()
+);
+
+// 2) Blobby polygon
+const blob = [];
+for (let i=0;i<40;i++){
+  const a = (i/40)*Math.PI*2;
+  const cx=W*0.25, cy=H*0.68, rx=Math.min(W,H)*0.12, ry=Math.min(W,H)*0.08;
+  const k = 0.70 + 0.30 * Math.sin(3*a);
+  blob.push([cx + Math.cos(a)*rx*k, cy + Math.sin(a)*ry*k]);
+}
+api.fillPath(api.path().poly(blob).closePath(), api.color(255,120,88,190), api.rule());
+
+// 3) Stroked random polyline with round joins/caps
+api.strokePath(api.path().poly(api.randomPolyline(220)),
+  api.param('strokeWidth'),
+  api.color(250,245,140,255),
+  { join: 'round', cap: 'round' }
+);
+        </textarea>
+        <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+          <button id="run">Run Code</button>
+          <button id="reset">Reset to Example</button>
+          <button id="helpBtn">API Help</button>
+        </div>
+        <p class="small">API: <span class="mono">api.path().moveTo(x,y).lineTo(x,y).poly(pts).closePath()</span>,
+        <span class="mono">api.fillPath(path, rgba, rule)</span>, <span class="mono">api.strokePath(path, width, rgba, opts)</span>.
+        Helpers: <span class="mono">api.star(...)</span>, <span class="mono">api.randomPolyline(n)</span>, <span class="mono">api.color(r,g,b,a)</span>, <span class="mono">api.rule()</span>, <span class="mono">api.width()</span>, <span class="mono">api.height()</span>, <span class="mono">api.param(name)</span>.</p>
+      </div>
+    </div>
+    <div class="panel"><canvas id="cv" width="800" height="600"></canvas></div>
+  </div>
+
+  <dialog id="helpDlg">
+    <h3>Path Builder API</h3>
+    <pre class="mono" style="white-space:pre-wrap; line-height:1.25">// Paths
+api.path()                // → Path
+  .moveTo(x, y)
+  .lineTo(x, y)
+  .poly([[x,y], ...])    // append many points
+  .closePath();
+
+// Fill & Stroke
+api.fillPath(path, rgba, rule?)
+api.strokePath(path, width, rgba, { join:'round', cap:'round' })
+
+// Helpers
+api.star(cx,cy,rOuter,rInner,n)
+api.randomPolyline(n)
+api.color(r,g,b,a)
+api.rule()               // current UI fill rule
+api.width(), api.height()
+api.param('strokeWidth') // read UI stroke width
+    </pre>
+    <div style="text-align:right; margin-top:8px;"><button id="helpClose">Close</button></div>
+  </dialog>
+
+<script>
+(function(){
+  // ---------- DOM & Controls ----------
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const sizeSel = document.getElementById('size');
+  const tileInp = document.getElementById('tile'); const tileVal = document.getElementById('tileVal');
+  const workersInp = document.getElementById('workers'); const workersVal = document.getElementById('workersVal');
+  const strokeInp = document.getElementById('stroke'); const strokeVal = document.getElementById('strokeVal');
+  const aaSel = document.getElementById('aa');
+  const btnRender = document.getElementById('rerender');
+  const btnRandom = document.getElementById('randomize');
+  const btnRule = document.getElementById('toggleRule'); const ruleTxt = document.getElementById('ruleTxt');
+  const tBuild = document.getElementById('tBuild'); const tRaster = document.getElementById('tRaster'); const tTiles = document.getElementById('tTiles');
+  const codeEl = document.getElementById('code');
+  const btnRun = document.getElementById('run');
+  const btnReset = document.getElementById('reset');
+  const helpBtn = document.getElementById('helpBtn');
+  const helpDlg = document.getElementById('helpDlg');
+  const helpClose = document.getElementById('helpClose');
+
+  const HW = Math.max(1, Math.min(16, (navigator.hardwareConcurrency||4)));
+  workersInp.max = String(HW); workersInp.value = String(Math.min(4, HW));
+  workersVal.textContent = workersInp.value;
+
+  tileInp.addEventListener('input', () => tileVal.textContent = tileInp.value);
+  workersInp.addEventListener('input', () => workersVal.textContent = workersInp.value);
+  strokeInp.addEventListener('input', () => strokeVal.textContent = strokeInp.value);
+
+  let fillRule = 'evenodd';
+  btnRule.addEventListener('click', () => { fillRule = (fillRule==='evenodd')?'nonzero':'evenodd'; ruleTxt.textContent = fillRule; });
+
+  sizeSel.addEventListener('change', () => { const [w,h]=sizeSel.value.split('x').map(Number); cv.width=w; cv.height=h; draw(); });
+  btnRender.addEventListener('click', draw);
+  btnRandom.addEventListener('click', () => { randomizeLines(true); draw(); });
+  btnRun.addEventListener('click', draw);
+  btnReset.addEventListener('click', () => { location.reload(); });
+  helpBtn.addEventListener('click', () => { if (typeof helpDlg.showModal === 'function') helpDlg.showModal(); else alert('API Help dialog not supported in this browser. See the API snippet in the panel.'); });
+  helpClose.addEventListener('click', () => helpDlg.close());
+
+  // ---------- Math helpers ----------
+  const TAU = Math.PI*2;
+  function angleOf(dx,dy){ return Math.atan2(dy,dx); }
+  function norm(dx,dy){ const L=Math.hypot(dx,dy)||1; return [-dy/L, dx/L]; } // left normal
+  function arcPoints(cx,cy,r,a0,a1,ccw,segments){
+    let sweep = a1 - a0;
+    if (ccw && sweep < 0) sweep += TAU; else if (!ccw && sweep > 0) sweep -= TAU;
+    const steps = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI/10))); // ~18°
+    const pts=[]; for (let i=0;i<=Math.min(segments||steps,64);i++){
+      const t=i/Math.max(1,(segments||steps));
+      const a = a0 + sweep*t;
+      pts.push([cx+Math.cos(a)*r, cy+Math.sin(a)*r]);
+    }
+    return pts;
+  }
+
+  // ---------- Stroke expansion with round joins & caps ----------
+  function strokeToPolys(polyline, width){
+    const polys=[]; if (polyline.length<2) return polys; const hw=width*0.5;
+    const N=polyline.length;
+    for (let i=0;i<N-1;i++){
+      const [x0,y0]=polyline[i], [x1,y1]=polyline[i+1];
+      const dx=x1-x0, dy=y1-y0; const L=Math.hypot(dx,dy); if (L===0) continue;
+      const [nx,ny]=norm(dx,dy); const hx=nx*hw, hy=ny*hw;
+      polys.push(Float32Array.from([ x0-hx, y0-hy,  x0+hx, y0+hy,  x1+hx, y1+hy,  x1-hx, y1-hy ]));
+    }
+    // Round caps
+    {
+      const [x0,y0]=polyline[0], [x1,y1]=polyline[1]; const a=angleOf(x0-x1,y0-y1);
+      const cap = arcPoints(x0,y0,hw,a-Math.PI/2,a+Math.PI/2,true,Math.ceil(hw/2));
+      const fan=[x0,y0]; for (const [x,y] of cap) fan.push(x,y); polys.push(Float32Array.from(fan));
+    }
+    {
+      const [xN1,yN1]=polyline[N-2], [xN,yN]=polyline[N-1]; const a=angleOf(xN-xN1,yN-yN1);
+      const cap = arcPoints(xN,yN,hw,a-Math.PI/2,a+Math.PI/2,true,Math.ceil(hw/2));
+      const fan=[xN,yN]; for (const [x,y] of cap) fan.push(x,y); polys.push(Float32Array.from(fan));
+    }
+    // Round joins
+    for (let i=1;i<N-1;i++){
+      const [xa,ya]=polyline[i-1], [xb,yb]=polyline[i], [xc,yc]=polyline[i+1];
+      const a0=angleOf(xb-xa,yb-ya); const a1=angleOf(xc-xb,yc-yb);
+      const n0=a0+Math.PI/2, n1=a1+Math.PI/2;
+      const cross=(xb-xa)*(yc-yb)-(yb-ya)*(xc-xb); const ccw=cross>0;
+      const arc=arcPoints(xb,yb,0.5*width,n0,n1,ccw,Math.ceil(width/2));
+      const fan=[xb,yb]; for (const [x,y] of arc) fan.push(x,y); polys.push(Float32Array.from(fan));
+    }
+    return polys;
+  }
+
+  // ---------- Prefix sum (exclusive) ----------
+  function exclusiveScan(u32){ const out=new Uint32Array(u32.length); let acc=0>>>0; for(let i=0;i<u32.length;i++){ out[i]=acc; acc=(acc+u32[i])>>>0; } return {offsets:out,total:acc>>>0}; }
+
+  // ---------- Path Builder API ----------
+  class Path {
+    constructor(){ this.curr=null; this.points=[]; }
+    moveTo(x,y){ this.curr=[x,y]; this.points.push([x,y]); return this; }
+    lineTo(x,y){ this.curr=[x,y]; this.points.push([x,y]); return this; }
+    poly(pts){ for (const p of pts) this.points.push([p[0],p[1]]); if (pts.length) this.curr=pts[pts.length-1]; return this; }
+    closePath(){ if (this.points.length>0){ const first=this.points[0]; const last=this.points[this.points.length-1]; if (first[0]!==last[0]||first[1]!==last[1]) this.points.push([first[0],first[1]]); } return this; }
+    toPolyline(){ return this.points.slice(); }
+  }
+
+  let randomLines=[];
+  function randomizeLines(forceNew=false){
+    const [W,H]=[cv.width,cv.height]; const pts=[]; const N=220; let x=W*0.15,y=H*0.25; const step=Math.min(W,H)*0.03;
+    for(let i=0;i<N;i++){ x=Math.max(20,Math.min(W-20,x+(Math.random()-0.5)*step*2)); y=Math.max(20,Math.min(H-20,y+(Math.random()-0.5)*step*2)); pts.push([x,y]); }
+    if (forceNew || randomLines.length===0) randomLines=pts; return randomLines;
+  }
+  function star(cx,cy,rOuter,rInner,n=5){ const pts=[]; const step=Math.PI/n; for(let i=0;i<2*n;i++){ const r=(i%2===0)?rOuter:rInner; const a=i*step-Math.PI/2; pts.push([cx+Math.cos(a)*r, cy+Math.sin(a)*r]); } return pts; }
+
+  function createAPI(shapeSink){
+    return {
+      width: () => cv.width,
+      height: () => cv.height,
+      rule: () => fillRule,
+      param: (name) => (name==='strokeWidth'? Number(strokeInp.value) : undefined),
+      color: (r,g,b,a) => Uint8ClampedArray.from([r|0,g|0,b|0,(a|0)]),
+      path: () => new Path(),
+      star: (cx,cy,ro,ri,n)=>star(cx,cy,ro,ri,n),
+      randomPolyline: (N)=> randomizeLines().slice(0,N|0),
+      fillPath: (path, rgba, rule) => {
+        const pts = path.toPolyline(); if (pts.length<3) return;
+        shapeSink.push({ verts: Float32Array.from(pts.flat()), color: rgba, rule: rule||fillRule });
+      },
+      strokePath: (path, width, rgba, opts) => {
+        const pts = path.toPolyline(); if (pts.length<2) return;
+        for (const p of strokeToPolys(pts, width)) shapeSink.push({ verts: p, color: rgba, rule: 'evenodd' });
+      }
+    };
+  }
+
+  function buildShapesFromCode(code){
+    const shapes=[]; const api=createAPI(shapes);
+    try { new Function('api', code)(api); }
+    catch(e){ console.error('User code error:', e); alert('Error in your code: '+e.message); return null; }
+    return shapes;
+  }
+
+  // ---------- Tiling (count → scan → scatter) ----------
+  function binShapesIntoTiles(shapes,tileSize){
+    const W=cv.width,H=cv.height; const tilesX=Math.ceil(W/tileSize), tilesY=Math.ceil(H/tileSize);
+    const tileCount=tilesX*tilesY; const counts=new Uint32Array(tileCount); const ranges=new Array(shapes.length);
+    for(let sIdx=0;sIdx<shapes.length;sIdx++){
+      const v=shapes[sIdx].verts; let minX=+Infinity,minY=+Infinity,maxX=-Infinity,maxY=-Infinity;
+      for(let i=0;i<v.length;i+=2){ const x=v[i],y=v[i+1]; if(x<minX)minX=x; if(y<minY)minY=y; if(x>maxX)maxX=x; if(y>maxY)maxY=y; }
+      const minTx=Math.max(0,Math.floor(minX/tileSize));
+      const maxTx=Math.min(tilesX-1,Math.floor(maxX/tileSize));
+      const minTy=Math.max(0,Math.floor(minY/tileSize));
+      const maxTy=Math.min(tilesY-1,Math.floor(maxY/tileSize));
+      ranges[sIdx]={minTx,maxTx,minTy,maxTy};
+      for(let ty=minTy;ty<=maxTy;ty++) for(let tx=minTx;tx<=maxTx;tx++) counts[ty*tilesX+tx]++;
+    }
+    const {offsets,total}=exclusiveScan(counts); const tileShapeIndex=new Uint32Array(total); const cursors=offsets.slice();
+    for (let sIdx=0;sIdx<shapes.length;sIdx++){
+      const r=ranges[sIdx]; for(let ty=r.minTy;ty<=r.maxTy;ty++) for(let tx=r.minTx;tx<=r.maxTx;tx++){ const t=ty*tilesX+tx; tileShapeIndex[cursors[t]++]=sIdx; }
+    }
+    return {tilesX,tilesY,tileCount,counts,offsets,tileShapeIndex};
+  }
+
+  // ---------- Worker (AA + fill with prefix‑sum) ----------
+  function makeWorkerURL(){
+    const workerFn=()=>{
+      function toPremul(rgba){ const a=rgba[3]/255; return [rgba[0]/255*a, rgba[1]/255*a, rgba[2]/255*a, a]; }
+      function over(dst,i,sr,sg,sb,sa){ const ida=1-sa; dst[i]=sr+dst[i]*ida; dst[i+1]=sg+dst[i+1]*ida; dst[i+2]=sb+dst[i+2]*ida; dst[i+3]=sa+dst[i+3]*ida; }
+
+      function fillPolygonTile(tileX,tileY,tileW,tileH,verts,rgba,rule,outF32,SS){
+        const n=verts.length>>>1; if(n<3) return;
+        const vx=new Float32Array(n), vy=new Float32Array(n);
+        for(let i=0,j=0;i<n;i++,j+=2){ vx[i]=verts[j]*SS; vy[i]=verts[j+1]*SS; }
+        const sTileX=tileX*SS, sTileY=tileY*SS, sW=tileW*SS, sH=tileH*SS;
+        const pitch=sW*4; const [sr,sg,sb,sa]=toPremul(rgba); const rowDelta=new Int32Array(sW+1);
+
+        for(let ry=0; ry<sH; ry++){
+          const gy=sTileY+ry+0.5; // supersampled row center
+          if(rule==='evenodd'){
+            const xs=[]; for(let i=0,j=n-1;i<n;j=i++){
+              const x0=vx[j],y0=vy[j],x1=vx[i],y1=vy[i]; const yMin=Math.min(y0,y1), yMax=Math.max(y0,y1);
+              if(gy<=yMin||gy>yMax) continue; const t=(gy-y0)/(y1-y0); xs.push(x0+t*(x1-x0)); }
+            if(xs.length<2) continue; xs.sort((a,b)=>a-b);
+            for(let k=0;k+1<xs.length;k+=2){ let x0=Math.floor(xs[k]-sTileX); let x1=Math.floor(xs[k+1]-sTileX);
+              if(x1<=0||x0>=sW) continue; if(x0<0) x0=0; if(x1>sW) x1=sW; rowDelta[x0]+=1; rowDelta[x1]-=1; }
+            let acc=0|0, base=ry*pitch; for(let x=0;x<sW;x++){ acc+=rowDelta[x]; if((acc&1)!==0){ over(outF32, base+x*4, sr,sg,sb,sa); } }
+            for(let x=0;x<=sW;x++) rowDelta[x]=0;
+          } else {
+            for(let i=0,j=n-1;i<n;j=i++){
+              const x0=vx[j],y0=vy[j],x1=vx[i],y1=vy[i]; const yMin=Math.min(y0,y1), yMax=Math.max(y0,y1);
+              if(gy<=yMin||gy>yMax) continue; const t=(gy-y0)/(y1-y0); const x=x0+t*(x1-x0);
+              let xi=Math.floor(x - sTileX); if(xi<0) xi=0; if(xi>sW) xi=sW; rowDelta[xi]+= (y1>y0)? +1 : -1;
+            }
+            let acc=0|0, base=ry*pitch; for(let x=0;x<sW;x++){ acc+=rowDelta[x]; if(acc!==0){ over(outF32, base+x*4, sr,sg,sb,sa); } }
+            for(let x=0;x<=sW;x++) rowDelta[x]=0;
+          }
+        }
+      }
+
+      function downsampleSSAA(srcF32,tileW,tileH,SS){
+        if(SS===1){
+          const out=new Uint8ClampedArray(tileW*tileH*4);
+          for(let p=0;p<tileW*tileH;p++){ const i=p*4; const a=Math.min(1,Math.max(0,srcF32[i+3]));
+            const r=a>1e-6? Math.round((srcF32[i]/a)*255):0; const g=a>1e-6? Math.round((srcF32[i+1]/a)*255):0; const b=a>1e-6? Math.round((srcF32[i+2]/a)*255):0; const A=Math.round(a*255);
+            out[i]=r; out[i+1]=g; out[i+2]=b; out[i+3]=A; }
+          return out;
+        }
+        const sW=tileW*SS, sH=tileH*SS; const out=new Uint8ClampedArray(tileW*tileH*4);
+        for(let y=0;y<tileH;y++){
+          for(let x=0;x<tileW;x++){
+            let r=0,g=0,b=0,a=0; for(let j=0;j<SS;j++) for(let i=0;i<SS;i++){
+              const sx=x*SS+i, sy=y*SS+j, idx=(sy*sW+sx)*4; r+=srcF32[idx]; g+=srcF32[idx+1]; b+=srcF32[idx+2]; a+=srcF32[idx+3]; }
+            r/=SS*SS; g/=SS*SS; b/=SS*SS; a/=SS*SS; const base=(y*tileW+x)*4;
+            const A=Math.min(1,a); const R=A>1e-6? Math.round((r/A)*255):0; const G=A>1e-6? Math.round((g/A)*255):0; const B=A>1e-6? Math.round((b/A)*255):0; out[base]=R; out[base+1]=G; out[base+2]=B; out[base+3]=Math.round(A*255);
+          }
+        }
+        return out;
+      }
+
+      self.onmessage=(e)=>{
+        const msg=e.data; if(msg.cmd!=='renderTiles') return;
+        const { tileSize, canvasW, canvasH, tilesX, tileIndices, offsets, counts, tileShapeIndex, shapes, SS } = msg;
+        const results=[];
+        for(const t of tileIndices){
+          const tx=t%tilesX, ty=(t/tilesX)|0; const tileX=tx*tileSize, tileY=ty*tileSize; const tileW=Math.min(tileSize, canvasW-tileX); const tileH=Math.min(tileSize, canvasH-tileY);
+          const fbuf=new Float32Array((tileW*SS)*(tileH*SS)*4);
+          const start=offsets[t]>>>0, cnt=counts[t]>>>0;
+          for(let i=0;i<cnt;i++){ const sIdx=tileShapeIndex[start+i]>>>0; const sh=shapes[sIdx]; fillPolygonTile(tileX,tileY,tileW,tileH, sh.verts, sh.color, sh.rule, fbuf, SS); }
+          const pixels=downsampleSSAA(fbuf,tileW,tileH,SS);
+          results.push({ t, tx, ty, tileX, tileY, tileW, tileH, pixels });
+        }
+        self.postMessage({ kind:'tilesDone', results }, results.map(r=>r.pixels.buffer));
+      };
+    };
+    const src=`(${workerFn.toString()})()`; const blob=new Blob([src],{type:'text/javascript'}); return URL.createObjectURL(blob);
+  }
+
+  // ---------- Orchestrate ----------
+  async function draw(){
+    const tileSize=Number(tileInp.value); const nWorkers=Number(workersInp.value); const SS=Number(aaSel.value)|0; const [W,H]=[cv.width,cv.height];
+    const t0=performance.now();
+    const shapes=buildShapesFromCode(codeEl.value);
+    const shapesSafe = (shapes && shapes.length>0) ? shapes : (function(){
+      // fallback scene (star + random stroke) if user code produced nothing
+      const s=star(W*0.5,H*0.45,Math.min(W,H)*0.28,Math.min(W,H)*0.12,7);
+      const arr=[{ verts: Float32Array.from(s.flat()), color: Uint8ClampedArray.from([88,156,255,220]), rule: fillRule }];
+      for (const p of strokeToPolys(randomizeLines(), Number(strokeInp.value))) arr.push({ verts:p, color: Uint8ClampedArray.from([250,245,140,255]), rule:'evenodd' });
+      return arr;
+    })();
+
+    const {tilesX,tilesY,tileCount,counts,offsets,tileShapeIndex}=binShapesIntoTiles(shapesSafe,tileSize);
+    const t1=performance.now();
+
+    const tileIds=new Uint32Array(tileCount); for(let i=0;i<tileCount;i++) tileIds[i]=i;
+    const buckets=Array.from({length:nWorkers},()=>[]); for(let i=0;i<tileCount;i++) buckets[i%nWorkers].push(tileIds[i]);
+
+    const workerURL=makeWorkerURL(); const workers=Array.from({length:nWorkers},()=>new Worker(workerURL));
+    const jobs=buckets.map((tileIndices,wi)=>new Promise(resolve=>{ const w=workers[wi]; w.onmessage=(e)=>{ if(e.data&&e.data.kind==='tilesDone') resolve(e.data.results); }; w.postMessage({ cmd:'renderTiles', tileSize, canvasW:W, canvasH:H, tilesX, tileIndices, offsets, counts, tileShapeIndex, shapes:shapesSafe, SS }); }));
+
+    const resultSets=await Promise.all(jobs); for(const w of workers) w.terminate(); URL.revokeObjectURL(workerURL);
+
+    const t2=performance.now(); ctx.clearRect(0,0,W,H);
+    for(const results of resultSets){ for(const r of results){ const img=new ImageData(r.pixels, r.tileW, r.tileH); ctx.putImageData(img, r.tileX, r.tileY); } }
+    const t3=performance.now();
+
+    tBuild.textContent=(t1-t0).toFixed(2)+' ms'; tRaster.textContent=(t3-t1).toFixed(2)+' ms'; tTiles.textContent=`${tilesX}×${Math.ceil(H/tileSize)} = ${tilesX*Math.ceil(H/tileSize)}`;
+  }
+
+  // Initial state
+  randomizeLines();
+  draw();
+})();
+</script>
+</body>
+</html>

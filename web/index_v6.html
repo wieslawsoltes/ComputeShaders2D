@@ -1,0 +1,1163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prefix‑Sum CPU Renderer (AA + Joins/Caps + Text + SVG, Parallel)</title>
+  <style>
+    :root { --bg:#0f1220; --panel:#12162b; --ink:#e7e9ef; --line:#232849; }
+    html,body { height:100%; margin:0; background:var(--bg); color:var(--ink);
+      font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,sans-serif; }
+    header { padding:12px 16px; background:#151934; position:sticky; top:0; z-index:5;
+      box-shadow:0 2px 8px rgba(0,0,0,.25); }
+    header h1 { margin:0; font-size:16px; font-weight:600; }
+    .row { display:grid; grid-template-columns:360px 1fr; gap:16px; padding:16px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; }
+    label { display:flex; align-items:center; gap:8px; margin:6px 0; }
+    input[type="range"] { width:100%; }
+    select, button { background:#2a3160; color:#fff; border:1px solid #3b4282;
+      border-radius:10px; padding:6px 8px; }
+    button { cursor:pointer; }
+    button:hover { filter:brightness(1.06); }
+    .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    .small { font-size:12px; opacity:.9; }
+    canvas { background:#0b0e1d; border:1px solid var(--line); border-radius:12px; width:100%; height:auto; image-rendering:pixelated; }
+    .row2 { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:8px; }
+    .stat { background:#0e1330; border:1px dashed #2e3569; border-radius:10px; padding:8px; text-align:center; }
+    dialog { border:1px solid #3b4282; border-radius:10px; background:#0b0e1d; color:#e7e9ef; max-width:840px; }
+    dialog::backdrop{ background: rgba(0,0,0,.45); }
+  </style>
+</head>
+<body>
+  <header><h1>Prefix‑Sum CPU Vector Renderer → AA + Joins/Caps + Text + SVG (Web Workers)</h1></header>
+
+  <div class="row">
+    <div class="panel">
+      <div><strong>Scene controls</strong></div>
+
+      <label>Canvas Size
+        <select id="size">
+          <option value="800x600">800 × 600</option>
+          <option value="1024x768">1024 × 768</option>
+          <option value="1280x720">1280 × 720</option>
+          <option value="1920x1080">1920 × 1080</option>
+        </select>
+      </label>
+
+      <label>Tile Size (px)
+        <input id="tile" type="range" min="16" max="128" value="64" step="16" />
+        <span id="tileVal" class="mono small">64</span>
+      </label>
+
+      <label>Workers
+        <input id="workers" type="range" min="1" max="16" value="4" />
+        <span id="workersVal" class="mono small">4</span>
+      </label>
+
+      <label>Stroke Width
+        <input id="stroke" type="range" min="1" max="40" value="10" />
+        <span id="strokeVal" class="mono small">10</span>
+      </label>
+
+      <label>Join
+        <select id="join">
+          <option value="round" selected>round</option>
+          <option value="bevel">bevel</option>
+          <option value="miter">miter</option>
+        </select>
+      </label>
+
+      <label>Cap
+        <select id="cap">
+          <option value="round" selected>round</option>
+          <option value="butt">butt</option>
+          <option value="square">square</option>
+        </select>
+      </label>
+
+      <label>Miter Limit
+        <input id="miter" type="range" min="1" max="10" step="0.25" value="4" />
+        <span id="miterVal" class="mono small">4</span>
+      </label>
+
+      <label>AA (supersample)
+        <select id="aa">
+          <option value="1">1× (off)</option>
+          <option value="2" selected>2×</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+
+      <div class="row2">
+        <button id="rerender">Render</button>
+        <button id="randomize">Randomize Lines</button>
+        <button id="toggleRule">Fill Rule: <span id="ruleTxt">evenodd</span></button>
+      </div>
+
+      <p class="small">
+        Pipeline: <span class="mono">count → exclusive‑scan → scatter</span> builds per‑tile lists.
+        Raster now uses <strong>span fills</strong> (no row‑wide prefix scans) for both fill rules.
+        Strokes expand to polygons with <strong>round/bevel/miter</strong> joins and <strong>round/butt/square</strong> caps. AA via <strong>SSAA</strong>.
+      </p>
+
+      <div class="row2">
+        <div class="stat"><div class="small">Build</div><div class="mono" id="tBuild">–</div></div>
+        <div class="stat"><div class="small">Raster</div><div class="mono" id="tRaster">–</div></div>
+        <div class="stat"><div class="small">Tiles</div><div class="mono" id="tTiles">–</div></div>
+      </div>
+
+      <div style="margin-top:12px">
+        <strong>Path Builder Playground</strong>
+        <textarea id="code" class="mono" style="width:100%; height:460px; background:#0b0e1d; color:#cfe1ff; border:1px solid #2e3569; border-radius:8px; padding:8px;">
+// This code runs inside an async function (you can await).
+// SVG arc + cubic demos at the bottom (items 6 & 7).
+
+const W = api.width(), H = api.height();
+const yellow = api.color(250,245,140,255);
+const sky    = api.color( 88,156,255,220);
+const coral  = api.color(255,120, 88,190);
+const white  = api.color(235,240,250,255);
+
+// Use a robust CORS-friendly font. If loading fails, fallback stroke font kicks in.
+const FONT_URL = 'https://raw.githubusercontent.com/IBM/plex/master/IBM-Plex-Sans/fonts/complete/ttf/IBM-Plex-Sans-Regular.ttf';
+const font = await api.loadFont(FONT_URL);
+
+// 1) Filled star
+api.fillPath(
+  api.path().poly(api.star(W*0.5, H*0.35, Math.min(W,H)*0.26, Math.min(W,H)*0.11, 7)).closePath(),
+  sky, api.rule()
+);
+
+// 2) Blobby polygon via ellipse + transform
+const blob = api.path()
+  .ellipse(W*0.26, H*0.68, Math.min(W,H)*0.12, Math.min(W,H)*0.08, 0)
+  .transform({scaleX:1.06, scaleY:1.0, rotate:0.08})
+  .closePath();
+api.fillPath(blob, coral, api.rule());
+
+// 3) Random polyline stroke (UI join/cap/miter)
+api.strokePath(
+  api.path().poly(api.randomPolyline(220)),
+  api.param('strokeWidth'),
+  yellow,
+  { join: api.param('join'), cap: api.param('cap'), miterLimit: api.param('miterLimit') }
+);
+
+// 4) Curves: cubic + quadratic
+const p = api.path().moveTo(W*0.12, H*0.15)
+  .bezierTo(W*0.28,H*0.06, W*0.42,H*0.28, W*0.52,H*0.15)
+  .quadTo  (W*0.64,H*0.03, W*0.78,H*0.16);
+api.strokePath(p, 8, api.color(160,220,255,255), { join:'round', cap:'round' });
+
+// 5) Text: outlines → polygons (getPath+kerning, centered)
+api.fillText  (font, "Prefix‑Sum + SVG", W*0.5, H*0.86, 44, white, { align:'center' });
+api.strokeText(font, "Round  •  Bevel  •  Miter", W*0.5, H*0.92, 28, 3, yellow, { align:'center', join:'miter', cap:'butt' });
+
+// 6) SVG path (ELLIPTICAL ARCS) → fill an ellipse via 'A' commands.
+// Define in a 960×540 viewBox, scale to canvas with path-level transform.
+const dLens = "M 480 240 m -160 0 a 160 120 0 1 0 320 0 a 160 120 0 1 0 -320 0 z";
+const lens = api.svgPath(dLens).transform({ scaleX: W/960, scaleY: H/540 });
+api.fillPath(lens, api.color(120, 210, 180, 170), api.rule());
+
+// 7) SVG path (INFINITY SIGN) → stroke with chosen join/cap
+const dInfinity = "M 120 270 C 200 110 360 110 440 270 C 520 430 680 430 760 270";
+const inf = api.svgPath(dInfinity).transform({ scaleX: W/880, scaleY: H/540 });
+api.strokePath(inf, 16, api.color(240, 220, 120, 255), { join: api.param('join'), cap: api.param('cap'), miterLimit: api.param('miterLimit') });
+
+// You can also call:
+// api.fillSVG(dLens, api.color(200,120,180,160));
+// api.strokeSVG(dInfinity, 12, api.color(255,255,255,255), { join:'round', cap:'round' });
+        </textarea>
+
+        <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+          <button id="run">Run Code</button>
+          <button id="reset">Reset to Example</button>
+          <button id="helpBtn">API Help</button>
+        </div>
+
+        <p class="small">API (new in <strong>bold</strong>): <span class="mono">api.path()</span> →
+          <span class="mono">moveTo, lineTo, quadTo, bezierTo, arc, rect, ellipse, <strong>transform</strong>, poly, closePath</span>;
+          <span class="mono">api.fillPath(path, rgba, rule)</span>,
+          <span class="mono">api.strokePath(path, width, rgba, { join, cap, miterLimit })</span>;
+          <span class="mono">api.loadFont(urlOrBuffer), api.fillText(...), api.strokeText(...)</span>;
+          <span class="mono"><strong>api.svgPath(d), api.fillSVG(d,...), api.strokeSVG(d,...)</strong></span>. Helpers: <span class="mono">api.star(...), api.randomPolyline(n), api.color(...), api.rule(), api.width(), api.height(), api.param(name)</span>.
+        </p>
+      </div>
+    </div>
+
+    <div class="panel"><canvas id="cv" width="800" height="600"></canvas></div>
+  </div>
+
+  <dialog id="helpDlg">
+    <h3>Path Builder API</h3>
+    <pre class="mono" style="white-space:pre-wrap; line-height:1.25">// Paths (multi‑subpath, path‑level transform)
+api.path()
+  .moveTo(x, y) .lineTo(x, y) .quadTo(cpx, cpy, x, y)
+  .bezierTo(c1x, c1y, c2x, c2y, x, y)
+  .arc(cx, cy, r, a0, a1, ccw?) .rect(x, y, w, h, rx?)
+  .ellipse(cx, cy, rx, ry, rot=0) .poly([[x,y], ...])
+  .transform({translateX,translateY,scaleX,scaleY,rotate}) // applies to all subpaths
+  .closePath();
+
+// Fill & Stroke
+api.fillPath(path, rgba, rule?)
+api.strokePath(path, width, rgba, { join:'round|bevel|miter', cap:'round|butt|square', miterLimit:4 })
+
+// Text (opentype.js with fallback stroke font; kerning/features enabled)
+const font = await api.loadFont('myfont.ttf');
+api.fillText(font, "Hello", x, y, size, rgba, { align:'left|center|right', letterSpacing:0 });
+api.strokeText(font, "World", x, y, size, width, rgba, { join, cap, miterLimit, align });
+
+// SVG Path
+const p = api.svgPath("M10 10 h 80 v 80 h -80 Z");
+api.fillPath(p, rgba, api.rule());
+api.strokePath(p, width, rgba, { join, cap, miterLimit });
+// Or:
+api.fillSVG(d, rgba, rule?);
+api.strokeSVG(d, width, rgba, { join, cap, miterLimit });
+
+// Helpers
+api.star(cx,cy,rOuter,rInner,n)
+api.randomPolyline(n)
+api.color(r,g,b,a)
+api.rule()               // UI fill rule
+api.width(), api.height()
+api.param('strokeWidth'|'join'|'cap'|'miterLimit')
+    </pre>
+    <div style="text-align:right; margin-top:8px;"><button id="helpClose">Close</button></div>
+  </dialog>
+
+<script>
+(function(){
+  // ---------- DOM & Controls ----------
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+
+  const sizeSel = document.getElementById('size');
+  const tileInp = document.getElementById('tile'); const tileVal = document.getElementById('tileVal');
+  const workersInp = document.getElementById('workers'); const workersVal = document.getElementById('workersVal');
+  const strokeInp = document.getElementById('stroke'); const strokeVal = document.getElementById('strokeVal');
+  const joinSel = document.getElementById('join');
+  const capSel = document.getElementById('cap');
+  const miterInp = document.getElementById('miter'); const miterVal = document.getElementById('miterVal');
+  const aaSel = document.getElementById('aa');
+
+  const btnRender = document.getElementById('rerender');
+  const btnRandom = document.getElementById('randomize');
+  const btnRule = document.getElementById('toggleRule'); const ruleTxt = document.getElementById('ruleTxt');
+  const tBuild = document.getElementById('tBuild'); const tRaster = document.getElementById('tRaster'); const tTiles = document.getElementById('tTiles');
+
+  const codeEl = document.getElementById('code');
+  const btnRun = document.getElementById('run');
+  const btnReset = document.getElementById('reset');
+  const helpBtn = document.getElementById('helpBtn');
+  const helpDlg = document.getElementById('helpDlg');
+  const helpClose = document.getElementById('helpClose');
+
+  const HW = Math.max(1, Math.min(16, (navigator.hardwareConcurrency||4)));
+  workersInp.max = String(HW); workersInp.value = String(Math.min(4, HW));
+  workersVal.textContent = workersInp.value;
+
+  tileInp.addEventListener('input', () => tileVal.textContent = tileInp.value);
+  workersInp.addEventListener('input', () => workersVal.textContent = workersInp.value);
+  strokeInp.addEventListener('input', () => strokeVal.textContent = strokeInp.value);
+  miterInp.addEventListener('input', () => miterVal.textContent = miterInp.value);
+
+  let fillRule = 'evenodd';
+  btnRule.addEventListener('click', () => { fillRule = (fillRule==='evenodd')?'nonzero':'evenodd'; ruleTxt.textContent = fillRule; });
+
+  sizeSel.addEventListener('change', () => { const [w,h]=sizeSel.value.split('x').map(Number); cv.width=w; cv.height=h; draw(); });
+  btnRender.addEventListener('click', draw);
+  btnRandom.addEventListener('click', () => { randomizeLines(true); draw(); });
+  btnRun.addEventListener('click', draw);
+  btnReset.addEventListener('click', () => { location.reload(); });
+  helpBtn.addEventListener('click', () => { if (typeof helpDlg.showModal === 'function') helpDlg.showModal(); else alert('API Help dialog not supported in this browser.'); });
+  helpClose.addEventListener('click', () => helpDlg.close());
+
+  // ---------- Math helpers ----------
+  const TAU = Math.PI*2;
+  function angleOf(dx,dy){ return Math.atan2(dy,dx); }
+  function norm(dx,dy){ const L=Math.hypot(dx,dy)||1; return [-dy/L, dx/L]; } // left normal
+  function unit(dx,dy){ const L=Math.hypot(dx,dy)||1; return [dx/L, dy/L]; }
+  function arcPoints(cx,cy,r,a0,a1,ccw,segments){
+    let sweep = a1 - a0;
+    if (ccw && sweep < 0) sweep += TAU; else if (!ccw && sweep > 0) sweep -= TAU;
+    const steps = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI/10))); // ~18°
+    const n = Math.min(segments||steps,64);
+    const pts=[]; for (let i=0;i<=n;i++){
+      const t=i/Math.max(1,n); const a = a0 + sweep*t;
+      pts.push([cx+Math.cos(a)*r, cy+Math.sin(a)*r]);
+    }
+    return pts;
+  }
+  function lineIntersect(p0, v0, p1, v1){ // returns [x,y] or null
+    const [x0,y0]=p0,[vx0,vy0]=v0,[x1,y1]=p1,[vx1,vy1]=v1;
+    const d = vx0*vy1 - vy0*vx1; if (Math.abs(d) < 1e-6) return null;
+    const t = ((x1-x0)*vy1 - (y1-y0)*vx1) / d;
+    return [x0 + t*vx0, y0 + t*vy0];
+  }
+
+  // ---------- SVG path parsing (M L H V C S Q T A Z) ----------
+  function parseSVGPathToPath(d){
+    const p = new Path();
+
+    // Tokenize commands and numbers (including exponents, signed, no separators)
+    const re = /([MmZzLlHhVvCcSsQqTtAa])|([+-]?(?:\d*\.\d+|\d+)(?:[eE][+-]?\d+)?)/g;
+    const toks=[]; d.replace(re,(m,cmd,num)=>toks.push(cmd||parseFloat(num)));
+
+    let i=0, cmd=null;
+    let cx=0, cy=0, sx=0, sy=0;
+    let prevC=null, prevQ=null;
+
+    function read(n){ const out=[]; for(let k=0;k<n;k++){ if (i>=toks.length || typeof toks[i]==='string') throw new Error('Bad SVG path data'); out.push(toks[i++]); } return out; }
+    function hasNum(){ return i<toks.length && typeof toks[i] !== 'string'; }
+    const DEG = Math.PI/180;
+
+    function arcToPoints(x0,y0, rx,ry, phiDeg, largeArc, sweep, x1,y1){
+      const phi = (phiDeg%360)*DEG, cosphi=Math.cos(phi), sinphi=Math.sin(phi);
+      if (rx===0 || ry===0) return [[x1,y1]];
+      const dx2=(x0-x1)/2, dy2=(y0-y1)/2;
+      const x1p= cosphi*dx2 + sinphi*dy2;
+      const y1p=-sinphi*dx2 + cosphi*dy2;
+
+      let rx2=rx*rx, ry2=ry*ry;
+      const lam=(x1p*x1p)/rx2 + (y1p*y1p)/ry2;
+      if (lam>1){ const s=Math.sqrt(lam); rx*=s; ry*=s; rx2=rx*rx; ry2=ry*ry; }
+
+      const sign=(largeArc===sweep)?-1:1;
+      const num=rx2*ry2 - rx2*y1p*y1p - ry2*x1p*x1p;
+      const den=rx2*y1p*y1p + ry2*x1p*x1p;
+      const coef=sign*Math.sqrt(Math.max(0,num/den));
+      const cxp=coef*(rx*y1p)/ry;
+      const cyp=coef*(-ry*x1p)/rx;
+
+      const cxAbs=cosphi*cxp - sinphi*cyp + (x0+x1)/2;
+      const cyAbs=sinphi*cxp + cosphi*cyp + (y0+y1)/2;
+
+      function unit(vx,vy){ const L=Math.hypot(vx,vy)||1; return [vx/L, vy/L]; }
+      function ang(u,v){ const a=Math.acos(Math.max(-1,Math.min(1,u[0]*v[0]+u[1]*v[1]))); return (u[0]*v[1]-u[1]*v[0])<0?-a:a; }
+
+      const u=unit((x1p-cxp)/rx, (y1p-cyp)/ry);
+      const v=unit((-x1p-cxp)/rx, (-y1p-cyp)/ry);
+      let theta=ang([1,0],u), delta=ang(u,v);
+      if (!sweep && delta>0) delta-=TAU;
+      if ( sweep && delta<0) delta+=TAU;
+
+      const segs=Math.max(1,Math.ceil(Math.abs(delta)/(Math.PI/12))); // ~15°
+      const pts=[];
+      for(let k=1;k<=segs;k++){
+        const t=k/segs, a=theta+delta*t;
+        const x=cxAbs + rx*Math.cos(a)*cosphi - ry*Math.sin(a)*sinphi;
+        const y=cyAbs + rx*Math.cos(a)*sinphi + ry*Math.sin(a)*cosphi;
+        pts.push([x,y]);
+      }
+      return pts;
+    }
+
+    while(i<toks.length){
+      if (typeof toks[i]==='string') cmd=toks[i++]; else if (!cmd) throw new Error('SVG path must start with a command');
+
+      switch(cmd){
+        case 'M': case 'm': {
+          const rel=(cmd==='m');
+          const [x,y]=read(2); const nx=rel?cx+x:x, ny=rel?cy+y:y;
+          p.moveTo(nx,ny); cx=nx; cy=ny; sx=nx; sy=ny; prevC=prevQ=null;
+          while(hasNum()){
+            const [x2,y2]=read(2); const nx2=rel?cx+x2:x2, ny2=rel?cy+y2:y2;
+            p.lineTo(nx2,ny2); cx=nx2; cy=ny2; prevC=prevQ=null;
+          }
+          break;
+        }
+        case 'L': case 'l': {
+          const rel=(cmd==='l');
+          while(hasNum()){
+            const [x,y]=read(2); const nx=rel?cx+x:x, ny=rel?cy+y:y;
+            p.lineTo(nx,ny); cx=nx; cy=ny; prevC=prevQ=null;
+          } break;
+        }
+        case 'H': case 'h': {
+          const rel=(cmd==='h');
+          while(hasNum()){
+            const [x]=read(1); const nx=rel?cx+x:x;
+            p.lineTo(nx,cy); cx=nx; prevC=prevQ=null;
+          } break;
+        }
+        case 'V': case 'v': {
+          const rel=(cmd==='v');
+          while(hasNum()){
+            const [y]=read(1); const ny=rel?cy+y:y;
+            p.lineTo(cx,ny); cy=ny; prevC=prevQ=null;
+          } break;
+        }
+        case 'C': case 'c': {
+          const rel=(cmd==='c');
+          while(hasNum()){
+            const [x1,y1,x2,y2,x,y]=read(6);
+            const c1x=rel?cx+x1:x1, c1y=rel?cy+y1:y1;
+            const c2x=rel?cx+x2:x2, c2y=rel?cy+y2:y2;
+            const nx =rel?cx+x :x , ny =rel?cy+y :y ;
+            p.bezierTo(c1x,c1y,c2x,c2y,nx,ny);
+            prevC=[c2x,c2y]; prevQ=null; cx=nx; cy=ny;
+          } break;
+        }
+        case 'S': case 's': {
+          const rel=(cmd==='s');
+          while(hasNum()){
+            const [x2,y2,x,y]=read(4);
+            let c1x=cx, c1y=cy;
+            if (prevC){ c1x=2*cx-prevC[0]; c1y=2*cy-prevC[1]; }
+            const c2x=rel?cx+x2:x2, c2y=rel?cy+y2:y2;
+            const nx =rel?cx+x :x , ny =rel?cy+y :y ;
+            p.bezierTo(c1x,c1y,c2x,c2y,nx,ny);
+            prevC=[c2x,c2y]; prevQ=null; cx=nx; cy=ny;
+          } break;
+        }
+        case 'Q': case 'q': {
+          const rel=(cmd==='q');
+          while(hasNum()){
+            const [x1,y1,x,y]=read(4);
+            const cpx=rel?cx+x1:x1, cpy=rel?cy+y1:y1;
+            const nx =rel?cx+x :x , ny =rel?cy+y :y ;
+            p.quadTo(cpx,cpy,nx,ny);
+            prevQ=[cpx,cpy]; prevC=null; cx=nx; cy=ny;
+          } break;
+        }
+        case 'T': case 't': {
+          const rel=(cmd==='t');
+          while(hasNum()){
+            const [x,y]=read(2);
+            let cpx=cx, cpy=cy;
+            if (prevQ){ cpx=2*cx-prevQ[0]; cpy=2*cy-prevQ[1]; }
+            const nx=rel?cx+x:x, ny=rel?cy+y:y;
+            p.quadTo(cpx,cpy,nx,ny);
+            prevQ=[cpx,cpy]; prevC=null; cx=nx; cy=ny;
+          } break;
+        }
+        case 'A': case 'a': {
+          const rel=(cmd==='a');
+          while(hasNum()){
+            const [rx,ry,phi,laf,sf,x,y]=read(7);
+            const nx=rel?cx+x:x, ny=rel?cy+y:y;
+            const pts=arcToPoints(cx,cy, Math.abs(rx),Math.abs(ry), phi, laf?1:0, sf?1:0, nx,ny);
+            for (const [px,py] of pts) p.lineTo(px,py);
+            cx=nx; cy=ny; prevC=prevQ=null;
+          } break;
+        }
+        case 'Z': case 'z': { p.closePath(); cx=sx; cy=sy; prevC=prevQ=null; break; }
+        default: throw new Error('Unknown SVG path command: '+cmd);
+      }
+    }
+    return p;
+  }
+
+  // ---------- Stroke expansion with round/bevel/miter joins & caps ----------
+  function strokeToPolys(polyline, width, opts={}){
+    const join = opts.join||'round';
+    const cap = opts.cap||'round';
+    const miterLimit = (opts.miterLimit!=null)? +opts.miterLimit : 4;
+    const polys=[]; if (polyline.length<2) return polys; const hw=width*0.5;
+
+    const isClosed = (polyline.length>=3) &&
+      (polyline[0][0]===polyline[polyline.length-1][0]) &&
+      (polyline[0][1]===polyline[polyline.length-1][1]);
+    const N=polyline.length;
+
+    // Segment quads
+    for (let i=0;i<N-1;i++){
+      const [x0,y0]=polyline[i], [x1,y1]=polyline[i+1];
+      const dx=x1-x0, dy=y1-y0; const L=Math.hypot(dx,dy); if (L===0) continue;
+      const [nx,ny]=norm(dx,dy); const hx=nx*hw, hy=ny*hw;
+      polys.push(Float32Array.from([ x0-hx, y0-hy,  x0+hx, y0+hy,  x1+hx, y1+hy,  x1-hx, y1-hy ]));
+    }
+
+    // Caps (open only)
+    if (!isClosed){
+      const [sx0,sy0]=polyline[0], [sx1,sy1]=polyline[1];
+      const [exN1,eyN1]=polyline[N-2], [ex,ey]=polyline[N-1];
+      const sa=angleOf(sx0-sx1,sy0-sy1), ea=angleOf(ex-exN1,ey-eyN1);
+      if (cap==='round'){
+        const cap0 = arcPoints(sx0,sy0,hw,sa-Math.PI/2,sa+Math.PI/2,true,Math.ceil(hw/2));
+        const fan0=[sx0,sy0]; for (const [x,y] of cap0) fan0.push(x,y); polys.push(Float32Array.from(fan0));
+        const cap1 = arcPoints(ex,ey,hw,ea-Math.PI/2,ea+Math.PI/2,true,Math.ceil(hw/2));
+        const fan1=[ex,ey]; for (const [x,y] of cap1) fan1.push(x,y); polys.push(Float32Array.from(fan1));
+      } else if (cap==='square'){
+        const [ux,uy]=unit(sx0-sx1,sy0-sy1); const [nx,ny]=norm(sx0-sx1,sy0-sy1);
+        polys.push(Float32Array.from([
+          sx0-nx*hw, sy0-ny*hw,
+          sx0+nx*hw, sy0+ny*hw,
+          sx0+nx*hw+ux*hw, sy0+ny*hw+uy*hw,
+          sx0-nx*hw+ux*hw, sy0-ny*hw+uy*hw
+        ]));
+        const [ux2,uy2]=unit(ex-exN1,ey-eyN1); const [nx2,ny2]=norm(ex-exN1,ey-eyN1);
+        polys.push(Float32Array.from([
+          ex-nx2*hw, ey-ny2*hw,
+          ex+nx2*hw, ey+ny2*hw,
+          ex+nx2*hw+ux2*hw, ey+ny2*hw+uy2*hw,
+          ex-nx2*hw+ux2*hw, ey-ny2*hw+uy2*hw
+        ]));
+      } // butt: nothing
+    }
+
+    // Joins
+    const first = isClosed ? 0 : 1;
+    const last  = isClosed ? N-1 : N-2;
+    for (let i=first;i<=last;i++){
+      const im1=(i-1+N)%N, ip1=(i+1)%N;
+      const [xa,ya]=polyline[im1], [xb,yb]=polyline[i], [xc,yc]=polyline[ip1];
+      const v0x=xb-xa, v0y=yb-ya; const v1x=xc-xb, v1y=yc-yb;
+      if ((v0x===0 && v0y===0) || (v1x===0 && v1y===0)) continue;
+
+      const a0=angleOf(v0x,v0y), a1=angleOf(v1x,v1y);
+      const n0=a0+Math.PI/2, n1=a1+Math.PI/2;
+      const cross=(v0x*v1y - v0y*v1x); const ccw=cross>0;
+
+      if (join==='round'){
+        const arc=arcPoints(xb,yb,hw,n0,n1,ccw,Math.ceil(width/2));
+        const fan=[xb,yb]; for (const [x,y] of arc) fan.push(x,y); polys.push(Float32Array.from(fan));
+        continue;
+      }
+
+      const s = ccw ? +1 : -1;
+      const [n0x,n0y]=[Math.cos(n0)*s, Math.sin(n0)*s];
+      const [n1x,n1y]=[Math.cos(n1)*s, Math.sin(n1)*s];
+      const p0=[xb + n0x*hw, yb + n0y*hw];
+      const p1=[xb + n1x*hw, yb + n1y*hw];
+
+      if (join==='bevel'){
+        polys.push(Float32Array.from([xb,yb, p0[0],p0[1], p1[0],p1[1]]));
+      } else if (join==='miter'){
+        const [t0x,t0y]=unit(v0x,v0y); const [t1x,t1y]=unit(v1x,v1y);
+        const m = lineIntersect(p0,[t0x,t0y], p1,[t1x,t1y]);
+        if (!m){ polys.push(Float32Array.from([xb,yb, p0[0],p0[1], p1[0],p1[1]])); continue; }
+        const ml = Math.hypot(m[0]-xb, m[1]-yb) / hw;
+        if (!isFinite(ml) || ml>miterLimit){
+          polys.push(Float32Array.from([xb,yb, p0[0],p0[1], p1[0],p1[1]]));
+        } else {
+          polys.push(Float32Array.from([xb,yb, p0[0],p0[1], m[0],m[1], p1[0],p1[1]]));
+        }
+      }
+    }
+    return polys;
+  }
+
+  // ---------- Prefix scan helper (still used in binning) ----------
+  function exclusiveScan(u32){
+    const out=new Uint32Array(u32.length); let acc=0>>>0;
+    for(let i=0;i<u32.length;i++){ out[i]=acc; acc=(acc+u32[i])>>>0; }
+    return {offsets:out,total:acc>>>0};
+  }
+
+  // ---------- Path class (multi-subpath) with PATH-LEVEL TRANSFORM ----------
+  class Path {
+    constructor(){
+      this._subs=[[]];
+      this._curr=[0,0]; this._hasCurr=false;
+      this._tf = { tx:0, ty:0, sx:1, sy:1, rot:0 }; // path-level transform
+    }
+    _sub(){ return this._subs[this._subs.length-1]; }
+    moveTo(x,y){ this._curr=[x,y]; this._sub().push({t:'M',x,y}); this._hasCurr=true; return this; }
+    lineTo(x,y){ if(!this._hasCurr) this.moveTo(x,y); else this._sub().push({t:'L',x,y}); this._curr=[x,y]; return this; }
+    quadTo(cpx,cpy,x,y){ this._sub().push({t:'Q',cpx,cpy,x,y}); this._curr=[x,y]; return this; }
+    bezierTo(c1x,c1y,c2x,c2y,x,y){ this._sub().push({t:'C',c1x,c1y,c2x,c2y,x,y}); this._curr=[x,y]; return this; }
+    arc(cx,cy,r,a0,a1,ccw=false,segments){ this._sub().push({t:'A',cx,cy,r,a0,a1,ccw,segments}); const a=ccw?a0:a1; this._curr=[cx+Math.cos(a)*r, cy+Math.sin(a)*r]; return this; }
+    rect(x,y,w,h,rx=0){
+      if(rx<=0){ this.moveTo(x,y).lineTo(x+w,y).lineTo(x+w,y+h).lineTo(x,y+h).closePath(); }
+      else { const r=Math.min(rx,Math.min(w,h)/2); const k=0.552284749831; const c=r*k;
+        this.moveTo(x+r,y).lineTo(x+w-r,y)
+          .bezierTo(x+w-r+c,y, x+w,y+r-c, x+w,y+r)
+          .lineTo(x+w,y+h-r)
+          .bezierTo(x+w,y+h-r+c, x+w-r+c,y+h, x+w-r,y+h)
+          .lineTo(x+r,y+h)
+          .bezierTo(x+r-c,y+h, x,y+h-r+c, x,y+h-r)
+          .lineTo(x,y+r)
+          .bezierTo(x,y+r-c, x+r-c,y, x+r,y)
+          .closePath(); }
+      return this;
+    }
+    ellipse(cx,cy,rx,ry,rot=0,segments=64){ this._sub().push({t:'E',cx,cy,rx,ry,rot,segments}); this._curr=[cx+rx*Math.cos(rot), cy+rx*Math.sin(rot)]; return this; }
+    poly(pts){ if(pts.length){ const [x0,y0]=pts[0]; this.moveTo(x0,y0); for(let i=1;i<pts.length;i++) this.lineTo(pts[i][0],pts[i][1]); } return this; }
+    transform({translateX=0,translateY=0,scaleX=1,scaleY=1,rotate=0}={}){
+      // Compose path-level transform (origin-based)
+      this._tf.tx += translateX; this._tf.ty += translateY;
+      this._tf.sx *= scaleX; this._tf.sy *= scaleY;
+      this._tf.rot += rotate;
+      return this;
+    }
+    closePath(){ this._sub().push({t:'Z'}); this._subs.push([]); this._hasCurr=false; return this; }
+
+    // Flatten → array of polylines (Float32Array). Flushed on M and Z (no cross-contour lines).
+    flatten(tol=0.25){
+      const out=[];
+      let curr=[0,0], start=[0,0];
+      // Start with PATH-LEVEL transform composed in
+      let tx=this._tf.tx, ty=this._tf.ty, sx=this._tf.sx, sy=this._tf.sy, rot=this._tf.rot;
+
+      function apply(x,y){
+        const xr=(x*sx), yr=(y*sy);
+        const X = xr*Math.cos(rot) - yr*Math.sin(rot) + tx;
+        const Y = xr*Math.sin(rot) + yr*Math.cos(rot) + ty;
+        return [X,Y];
+      }
+
+      let pts=[]; let closed=false;
+
+      function flush(forceClose=false){
+        if (pts.length<2) { pts=[]; closed=false; return; }
+        const isClosed = forceClose || closed;
+        const n = pts.length*2 + (isClosed?2:0);
+        const flat = new Float32Array(n);
+        for (let i=0;i<pts.length;i++){ flat[i*2]=pts[i][0]; flat[i*2+1]=pts[i][1]; }
+        if (isClosed){ flat[n-2]=pts[0][0]; flat[n-1]=pts[0][1]; }
+        out.push(flat);
+        pts=[]; closed=false;
+      }
+
+      for (const sub of this._subs){
+        if (!sub.length) continue;
+        // Note: no per-sub reset of transform; path-level tf applies to all subpaths.
+
+        for (const cmd of sub){
+          if (cmd.t==='M'){ flush(false); start=apply(cmd.x,cmd.y); curr=start; pts.push(start); continue; }
+          if (cmd.t==='L'){ const p=apply(cmd.x,cmd.y); pts.push(p); curr=p; continue; }
+
+          if (cmd.t==='Q'){
+            const [x0,y0]=curr; const p1=apply(cmd.cpx,cmd.cpy); const p2=apply(cmd.x,cmd.y);
+            const stack=[[x0,y0,p1[0],p1[1],p2[0],p2[1],0]];
+            while(stack.length){
+              const [x0,y0,cx,cy,x1,y1,depth]=stack.pop();
+              const mx=(x0+2*cx+x1)/4, my=(y0+2*cy+y1)/4;
+              const lx=(x0+x1)/2, ly=(y0+y1)/2;
+              const err=Math.hypot(mx-lx,my-ly);
+              if (err<=tol || depth>10){ pts.push([x1,y1]); }
+              else {
+                const q0x=(x0+cx)/2, q0y=(y0+cy)/2;
+                const q1x=(cx+x1)/2, q1y=(cy+y1)/2;
+                const hx=(q0x+q1x)/2, hy=(q0y+q1y)/2;
+                stack.push([hx,hy,q1x,q1y,x1,y1,depth+1]);
+                stack.push([x0,y0,q0x,q0y,hx,hy,depth+1]);
+              }
+            }
+            curr=p2; continue;
+          }
+
+          if (cmd.t==='C'){
+            const [x0,y0]=curr;
+            const p1=apply(cmd.c1x,cmd.c1y), p2=apply(cmd.c2x,cmd.c2y), p3=apply(cmd.x,cmd.y);
+            const stack=[[x0,y0,p1[0],p1[1],p2[0],p2[1],p3[0],p3[1],0]];
+            while(stack.length){
+              const [x0,y0,c1x,c1y,c2x,c2y,x1,y1,depth]=stack.pop();
+              const dx = x1 - x0, dy = y1 - y0;
+              const d1 = Math.abs((c1x - x1)*dy - (c1y - y1)*dx);
+              const d2 = Math.abs((c2x - x1)*dy - (c2y - y1)*dx);
+              if ((d1 + d2) <= tol*6 || depth>10){ pts.push([x1,y1]); }
+              else {
+                const x01=(x0+c1x)/2, y01=(y0+c1y)/2;
+                const x12=(c1x+c2x)/2, y12=(c1y+c2y)/2;
+                const x23=(c2x+x1)/2, y23=(c2y+y1)/2;
+                const xa=(x01+x12)/2, ya=(y01+y12)/2;
+                const xb=(x12+x23)/2, yb=(y12+y23)/2;
+                const xm=(xa+xb)/2, ym=(ya+yb)/2;
+                stack.push([xm,ym,xb,yb,x23,y23,x1,y1,depth+1]);
+                stack.push([x0,y0,x01,y01,xa,ya,xm,ym,depth+1]);
+              }
+            }
+            curr=p3; continue;
+          }
+
+          if (cmd.t==='A'){
+            const ptsArc=arcPoints(cmd.cx,cmd.cy,cmd.r,cmd.a0,cmd.a1,cmd.ccw,cmd.segments||Math.ceil(cmd.r/2));
+            for (let i=1;i<ptsArc.length;i++) pts.push(ptsArc[i]);
+            curr=ptsArc[ptsArc.length-1]; continue;
+          }
+
+          if (cmd.t==='E'){
+            const {cx,cy,rx,ry,rot,segments}=cmd;
+            const steps=Math.max(8,Math.min(segments||64,256));
+            for(let i=1;i<=steps;i++){
+              const t=i/steps*TAU;
+              const x=cx+rx*Math.cos(t), y=cy+ry*Math.sin(t);
+              const xr=(x-cx), yr=(y-cy);
+              const X = xr*Math.cos(rot)-yr*Math.sin(rot)+cx;
+              const Y = xr*Math.sin(rot)+yr*Math.cos(rot)+cy;
+              pts.push([X,Y]);
+            }
+            curr=pts[pts.length-1]; continue;
+          }
+
+          if (cmd.t==='Z'){ closed=true; flush(true); continue; }
+        }
+        flush(false);
+      }
+      return out;
+    }
+  }
+
+  // ---------- Simple fallback stroke "font" with basic punctuation ----------
+  const SIMPLE_FONT = {
+    h:10, a:6,
+    map: {
+      ' ':[], '.':[[3,10],[3,10]], ',':[[3,10],[2,12]],
+      '-':[[1,5],[5,5]], ':':[[3,3],[3,3],[3,8],[3,8]],
+      ...{
+        'A':[[0,10],[3,0],[6,10]], 'B':[[0,0],[0,10],[4,10],[5,9],[5,6],[4,5],[0,5],[4,5],[5,4],[5,1],[4,0],[0,0]],
+        'C':[[6,1],[5,0],[1,0],[0,1],[0,9],[1,10],[5,10],[6,9]],
+        'D':[[0,0],[0,10],[3,10],[6,7],[6,3],[3,0],[0,0]],
+        'E':[[6,0],[0,0],[0,10],[6,10],[0,10],[0,5],[5,5],[0,5],[0,0],[6,0]],
+        'F':[[0,0],[0,10],[6,10],[0,10],[0,5],[5,5]],
+        'G':[[6,1],[5,0],[1,0],[0,1],[0,9],[1,10],[5,10],[6,9],[6,6],[3,6]],
+        'H':[[0,0],[0,10],[0,5],[6,5],[6,10],[6,0]],
+        'I':[[0,0],[6,0],[3,0],[3,10],[0,10],[6,10]],
+        'J':[[6,10],[6,2],[5,0],[3,0],[1,1],[0,3]],
+        'K':[[0,0],[0,10],[0,5],[6,10],[0,5],[6,0]],
+        'L':[[0,10],[0,0],[6,0]],
+        'M':[[0,0],[0,10],[3,6],[6,10],[6,0]],
+        'N':[[0,0],[0,10],[6,0],[6,10]],
+        'O':[[1,0],[5,0],[6,1],[6,9],[5,10],[1,10],[0,9],[0,1],[1,0]],
+        'P':[[0,0],[0,10],[4,10],[5,9],[5,7],[4,6],[0,6]],
+        'Q':[[1,0],[5,0],[6,1],[6,9],[5,10],[1,10],[0,9],[0,1],[1,0],[4,3],[6,0]],
+        'R':[[0,0],[0,10],[4,10],[5,9],[5,7],[4,6],[0,6],[4,6],[6,0]],
+        'S':[[6,1],[5,0],[1,0],[0,1],[0,4],[1,5],[5,5],[6,6],[6,9],[5,10],[1,10],[0,9]],
+        'T':[[0,10],[6,10],[3,10],[3,0]],
+        'U':[[0,10],[0,2],[1,0],[5,0],[6,2],[6,10]],
+        'V':[[0,10],[3,0],[6,10]],
+        'W':[[0,10],[2,0],[3,5],[4,0],[6,10]],
+        'X':[[0,10],[6,0],[3,5],[0,0],[6,10]],
+        'Y':[[0,10],[3,6],[3,0],[3,6],[6,10]],
+        'Z':[[0,10],[6,10],[0,0],[6,0]],
+        '0':[[1,0],[5,0],[6,1],[6,9],[5,10],[1,10],[0,9],[0,1],[1,0],[5,10]],
+        '1':[[1,8],[3,10],[3,0],[0,0],[6,0]],
+        '2':[[0,9],[1,10],[5,10],[6,9],[6,7],[0,0],[6,0]],
+        '3':[[0,10],[6,10],[3,6],[5,6],[6,5],[6,1],[5,0],[1,0],[0,1]],
+        '4':[[6,6],[0,6],[4,10],[4,0]],
+        '5':[[6,10],[0,10],[0,6],[5,6],[6,5],[6,1],[5,0],[1,0],[0,1]],
+        '6':[[6,9],[5,10],[1,10],[0,9],[0,1],[1,0],[5,0],[6,1],[6,5],[5,6],[0,6]],
+        '7':[[0,10],[6,10],[1,0]],
+        '8':[[1,5],[0,6],[0,9],[1,10],[5,10],[6,9],[6,6],[5,5],[1,5],[0,4],[0,1],[1,0],[5,0],[6,1],[6,4],[5,5]],
+        '9':[[6,5],[5,6],[1,6],[0,5],[0,1],[1,0],[5,0],[6,1],[6,9],[5,10],[1,10],[0,9]]
+      }
+    }
+  };
+
+  // ---------- opentype.js loader (graceful fallback) ----------
+  async function loadOpentype(){
+    if (window.opentype) return window.opentype;
+    try{
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/opentype.js@latest/dist/opentype.min.js';
+        s.onload = resolve; s.onerror = reject;
+        document.head.appendChild(s);
+      });
+      return window.opentype || null;
+    } catch (e) {
+      console.warn('opentype.js failed to load; using SIMPLE_FONT fallback.', e);
+      return null;
+    }
+  }
+  async function loadFont(urlOrBuffer){
+    const ot = await loadOpentype();
+    if (!ot) return { __simple: true };
+    try {
+      if (typeof urlOrBuffer === 'string') {
+        return await new Promise((res, rej) =>
+          ot.load(urlOrBuffer, (err, font) => err ? rej(err) : res(font))
+        );
+      } else {
+        return ot.parse(urlOrBuffer);
+      }
+    } catch (e) {
+      console.warn('Font load failed, using SIMPLE_FONT fallback:', e);
+      return { __simple: true };
+    }
+  }
+
+  // ---------- Text → Path (revised: use getPath + advanceWidth if available) ----------
+  function textToPath(font, text, x, y, size, opts={}){
+    const align = opts.align||'left';
+    const letterSpacing = +opts.letterSpacing||0;
+
+    if (font && !font.__simple && font.getPath){
+      const options = { kerning: true, features: { liga: true } };
+      let adv = font.getAdvanceWidth(text, size, options) + letterSpacing * Math.max(0, text.length-1);
+      let penX = x, penY = y;
+      if (align==='center') penX -= adv*0.5;
+      else if (align==='right') penX -= adv;
+
+      const gp = font.getPath(text, penX, penY, size, options);
+      const path = new Path();
+      let open=false;
+      for (const c of gp.commands){
+        if (c.type==='M'){ path.moveTo(c.x, c.y); open=true; }
+        else if (c.type==='L'){ path.lineTo(c.x, c.y); }
+        else if (c.type==='Q'){ path.quadTo(c.x1,c.y1, c.x,c.y); }
+        else if (c.type==='C'){ path.bezierTo(c.x1,c.y1, c.x2,c.y2, c.x,c.y); }
+        else if (c.type==='Z'){ path.closePath(); open=false; }
+      }
+      if (open) path.closePath();
+      return path;
+    }
+
+    // SIMPLE_FONT fallback (stroke centerlines; includes basic punctuation & spaces)
+    const path = new Path();
+    const adv = SIMPLE_FONT.a * (size/SIMPLE_FONT.h);
+    let penX = x, penY=y; const s = size/SIMPLE_FONT.h;
+
+    // Align measure
+    if (align!=='left'){
+      let count=0;
+      for (const ch of text){ const poly=SIMPLE_FONT.map[ch.toUpperCase()]||SIMPLE_FONT.map[ch]; count += 1; } // approximate
+      const width = count*adv + Math.max(0,count-1)*letterSpacing;
+      if (align==='center') penX -= width/2; else if (align==='right') penX -= width;
+    }
+
+    for (const raw of text){
+      const ch = (SIMPLE_FONT.map[raw] ? raw : raw.toUpperCase());
+      const poly = SIMPLE_FONT.map[ch];
+      if (poly && poly.length){
+        const [x0,y0] = [penX + poly[0][0]*s, penY + (SIMPLE_FONT.h-poly[0][1])*s];
+        path.moveTo(x0,y0);
+        for (let i=1;i<poly.length;i++){
+          const px = penX + poly[i][0]*s;
+          const py = penY + (SIMPLE_FONT.h-poly[i][1])*s;
+          path.lineTo(px,py);
+        }
+      }
+      penX += (raw===' ' ? adv*0.6 : adv) + letterSpacing;
+    }
+    return path;
+  }
+
+  // ---------- Path Builder API ----------
+  let randomLines=[];
+  function randomizeLines(forceNew=false){
+    const [W,H]=[cv.width,cv.height]; const pts=[]; const N=220; let x=W*0.15,y=H*0.25; const step=Math.min(W,H)*0.03;
+    for(let i=0;i<N;i++){ x=Math.max(20,Math.min(W-20,x+(Math.random()-0.5)*step*2)); y=Math.max(20,Math.min(H-20,y+(Math.random()-0.5)*step*2)); pts.push([x,y]); }
+    if (forceNew || randomLines.length===0) randomLines=pts; return randomLines;
+  }
+  function star(cx,cy,rOuter,rInner,n=5){ const pts=[]; const step=Math.PI/n; for(let i=0;i<2*n;i++){ const r=(i%2===0)?rOuter:rInner; const a=i*step-Math.PI/2; pts.push([cx+Math.cos(a)*r, cy+Math.sin(a)*r]); } return pts; }
+
+  function createAPI(shapeSink){
+    const fillPathImpl = (path, rgba, rule) => {
+      const polys = path.flatten(0.35);
+      for (const verts of polys){
+        if (verts.length<6) continue;
+        const n = verts.length;
+        const closed = (verts[0]===verts[n-2] && verts[1]===verts[n-1]);
+        if (closed) shapeSink.push({ verts, color: rgba, rule: rule||fillRule });
+      }
+    };
+    const strokePathImpl = (path, width, rgba, opts={}) => {
+      const flats = path.flatten(0.35);
+      for (const flat of flats){
+        const pts=[]; for (let i=0;i<flat.length;i+=2) pts.push([flat[i],flat[i+1]]);
+        const pieces = strokeToPolys(pts, width, opts);
+        for (const poly of pieces) shapeSink.push({ verts: poly, color: rgba, rule: 'evenodd' });
+      }
+    };
+
+    return {
+      width: () => cv.width,
+      height: () => cv.height,
+      rule: () => fillRule,
+      param: (name) => {
+        if (name==='strokeWidth') return Number(strokeInp.value);
+        if (name==='join') return String(joinSel.value);
+        if (name==='cap') return String(capSel.value);
+        if (name==='miterLimit') return Number(miterInp.value);
+        return undefined;
+      },
+      color: (r,g,b,a) => Uint8ClampedArray.from([r|0,g|0,b|0,(a|0)]),
+      path: () => new Path(),
+      star: (cx,cy,ro,ri,n)=>star(cx,cy,ro,ri,n),
+      randomPolyline: (N)=> randomizeLines().slice(0,N|0),
+
+      // Font & text
+      loadFont: (src) => loadFont(src),
+      textPath: (font, text, x, y, size, opts) => textToPath(font, text, x, y, size, opts),
+      fillText: (font, text, x, y, size, rgba, opts={}) => {
+        const p = textToPath(font, text, x, y, size, opts);
+        const flats = p.flatten(0.35);
+        if (font && font.__simple){
+          const width = Math.max(1, size*0.12);
+          for (const flat of flats){
+            const pts=[]; for (let i=0;i<flat.length;i+=2) pts.push([flat[i],flat[i+1]]);
+            for (const poly of strokeToPolys(pts, width, { join:'round', cap:'round' }))
+              shapeSink.push({ verts: poly, color: rgba, rule: 'evenodd' });
+          }
+        } else {
+          for (const verts of flats){
+            if (verts.length >= 6){
+              const n = verts.length;
+              const closed = (verts[0]===verts[n-2] && verts[1]===verts[n-1]);
+              if (closed) shapeSink.push({ verts, color: rgba, rule: fillRule });
+            }
+          }
+        }
+      },
+      strokeText: (font, text, x, y, size, width, rgba, opts={}) => {
+        const p = textToPath(font, text, x, y, size, opts);
+        const flats = p.flatten(0.35);
+        for (const flat of flats) {
+          const pts = []; for (let i=0;i<flat.length;i+=2) pts.push([flat[i], flat[i+1]]);
+          for (const poly of strokeToPolys(pts, width, opts))
+            shapeSink.push({ verts: poly, color: rgba, rule: 'evenodd' });
+        }
+      },
+
+      // SVG Path helpers
+      svgPath: (d) => parseSVGPathToPath(d),
+      fillSVG: (d, rgba, rule) => fillPathImpl(parseSVGPathToPath(d), rgba, rule),
+      strokeSVG: (d, width, rgba, opts={}) => strokePathImpl(parseSVGPathToPath(d), width, rgba, opts),
+
+      // Core fill/stroke
+      fillPath: fillPathImpl,
+      strokePath: strokePathImpl,
+    };
+  }
+
+  async function buildShapesFromCode(code){
+    const shapes=[]; const api=createAPI(shapes);
+    try {
+      const run = new Function('api', `return (async () => { ${code}\n })()`);
+      await run(api);
+    } catch(e){
+      console.error('User code error:', e);
+      alert('Error in your code: '+ e.message);
+      return null;
+    }
+    return shapes;
+  }
+
+  // ---------- Tiling (count → scan → scatter) ----------
+  function binShapesIntoTiles(shapes,tileSize){
+    const W=cv.width,H=cv.height; const tilesX=Math.ceil(W/tileSize), tilesY=Math.ceil(H/tileSize);
+    const tileCount=tilesX*tilesY; const counts=new Uint32Array(tileCount); const ranges=new Array(shapes.length);
+    for(let sIdx=0;sIdx<shapes.length;sIdx++){
+      const v=shapes[sIdx].verts; let minX=+Infinity,minY=+Infinity,maxX=-Infinity,maxY=-Infinity;
+      for(let i=0;i<v.length;i+=2){ const x=v[i],y=v[i+1]; if(x<minX)minX=x; if(y<minY)minY=y; if(x>maxX)maxX=x; if(y>maxY)maxY=y; }
+      const minTx=Math.max(0,Math.floor(minX/tileSize));
+      const maxTx=Math.min(tilesX-1,Math.floor(maxX/tileSize));
+      const minTy=Math.max(0,Math.floor(minY/tileSize));
+      const maxTy=Math.min(tilesY-1,Math.floor(maxY/tileSize));
+      ranges[sIdx]={minTx,maxTx,minTy,maxTy};
+      for(let ty=minTy;ty<=maxTy;ty++) for(let tx=minTx;tx<=maxTx;tx++) counts[ty*tilesX+tx]++;
+    }
+    const {offsets,total}=exclusiveScan(counts); const tileShapeIndex=new Uint32Array(total); const cursors=offsets.slice();
+    for (let sIdx=0;sIdx<shapes.length;sIdx++){
+      const r=ranges[sIdx];
+      for(let ty=r.minTy;ty<=r.maxTy;ty++)
+        for(let tx=r.minTx;tx<=r.maxTx;tx++){
+          const t=ty*tilesX+tx; tileShapeIndex[cursors[t]++]=sIdx;
+        }
+    }
+    return {tilesX,tilesY,tileCount,counts,offsets,tileShapeIndex};
+  }
+
+  // ---------- Worker (AA + span fill raster) ----------
+  function makeWorkerURL(){
+    const workerFn=()=>{
+      // NOTE: SIMD.js is deprecated; this worker uses tight typed loops + spans.
+      function toPremul(rgba){ const a=rgba[3]/255; return [rgba[0]/255*a, rgba[1]/255*a, rgba[2]/255*a, a]; }
+      function over(dst,i,sr,sg,sb,sa){ const ida=1-sa; dst[i]=sr+dst[i]*ida; dst[i+1]=sg+dst[i+1]*ida; dst[i+2]=sb+dst[i+2]*ida; dst[i+3]=sa+dst[i+3]*ida; }
+
+      // Span fill (evenodd): pairwise intervals
+      function fillRowEvenOdd(xs, sTileX, sW, base, outF32, sr,sg,sb,sa){
+        if (xs.length<2) return;
+        xs.sort((a,b)=>a-b);
+        for (let k=0; k+1<xs.length; k+=2){
+          let x0 = Math.floor(xs[k]   - sTileX);
+          let x1 = Math.floor(xs[k+1] - sTileX);
+          if (x1<=0 || x0>=sW) continue;
+          if (x0<0) x0=0; if (x1>sW) x1=sW;
+          // Unrolled pixel loop
+          let i = base + (x0<<2), end = base + (x1<<2);
+          for (; i+16<=end; i+=16){ over(outF32,i,sr,sg,sb,sa); over(outF32,i+4,sr,sg,sb,sa); over(outF32,i+8,sr,sg,sb,sa); over(outF32,i+12,sr,sg,sb,sa); }
+          for (; i<end; i+=4){ over(outF32,i,sr,sg,sb,sa); }
+        }
+      }
+
+      // Span fill (nonzero): signed events
+      function fillRowNonZero(events, sTileX, sW, base, outF32, sr,sg,sb,sa){
+        if (events.length===0) return;
+        // Sort by x; for ties, incoming order doesn't matter after we sum weights at same x
+        events.sort((a,b)=>a.x-b.x);
+        let w=0, spanStart=null;
+        let j=0;
+        while (j<events.length){
+          const x = events[j].x;
+          // Coalesce all events at this x
+          let sum=0; do { sum += events[j].w; j++; } while(j<events.length && events[j].x===x);
+          const prevW = w; w += sum;
+          if (prevW===0 && w!==0){
+            // Start span at x
+            spanStart = x;
+          } else if (prevW!==0 && w===0){
+            // End span at x
+            let x0=Math.floor(spanStart - sTileX);
+            let x1=Math.floor(x - sTileX);
+            if (x1<=0 || x0>=sW) continue;
+            if (x0<0) x0=0; if (x1>sW) x1=sW;
+            let i = base + (x0<<2), end = base + (x1<<2);
+            for (; i+16<=end; i+=16){ over(outF32,i,sr,sg,sb,sa); over(outF32,i+4,sr,sg,sb,sa); over(outF32,i+8,sr,sg,sb,sa); over(outF32,i+12,sr,sg,sb,sa); }
+            for (; i<end; i+=4){ over(outF32,i,sr,sg,sb,sa); }
+            spanStart=null;
+          }
+        }
+      }
+
+      function fillPolygonTile(tileX,tileY,tileW,tileH,verts,rgba,rule,outF32,SS){
+        const n=verts.length>>>1; if(n<3) return;
+        const vx=new Float32Array(n), vy=new Float32Array(n);
+        for(let i=0,j=0;i<n;i++,j+=2){ vx[i]=verts[j]*SS; vy[i]=verts[j+1]*SS; }
+        const sTileX=tileX*SS, sTileY=tileY*SS, sW=tileW*SS, sH=tileH*SS;
+        const pitch=sW*4; const [sr,sg,sb,sa]=toPremul(rgba);
+
+        // Per-row scanline
+        for(let ry=0; ry<sH; ry++){
+          const gy=sTileY+ry+0.5;
+          const base=ry*pitch;
+
+          if(rule==='evenodd'){
+            const xs=[]; // intersections
+            for(let i=0,j=n-1;i<n;j=i++){
+              const x0=vx[j],y0=vy[j],x1=vx[i],y1=vy[i];
+              const yMin=(y0<y1)?y0:y1, yMax=(y0>y1)?y0:y1;
+              if(gy<=yMin || gy>yMax) continue;
+              const t=(gy-y0)/(y1-y0); xs.push(x0+t*(x1-x0));
+            }
+            fillRowEvenOdd(xs, sTileX, sW, base, outF32, sr,sg,sb,sa);
+          } else {
+            const ev=[]; // {x, w}
+            for(let i=0,j=n-1;i<n;j=i++){
+              const x0=vx[j],y0=vy[j],x1=vx[i],y1=vy[i];
+              const yMin=(y0<y1)?y0:y1, yMax=(y0>y1)?y0:y1;
+              if(gy<=yMin || gy>yMax) continue;
+              const t=(gy-y0)/(y1-y0); const x=x0+t*(x1-x0);
+              ev.push({x, w:(y1>y0)?+1:-1});
+            }
+            fillRowNonZero(ev, sTileX, sW, base, outF32, sr,sg,sb,sa);
+          }
+        }
+      }
+
+      function downsampleSSAA(srcF32,tileW,tileH,SS){
+        if(SS===1){
+          const out=new Uint8ClampedArray(tileW*tileH*4);
+          for(let p=0;p<tileW*tileH;p++){
+            const i=p*4; const a=Math.min(1,Math.max(0,srcF32[i+3]));
+            const r=a>1e-6? Math.round((srcF32[i]/a)*255):0;
+            const g=a>1e-6? Math.round((srcF32[i+1]/a)*255):0;
+            const b=a>1e-6? Math.round((srcF32[i+2]/a)*255):0;
+            const A=Math.round(a*255);
+            out[i]=r; out[i+1]=g; out[i+2]=b; out[i+3]=A;
+          }
+          return out;
+        }
+        const sW=tileW*SS, sH=tileH*SS; const out=new Uint8ClampedArray(tileW*tileH*4);
+        const area=SS*SS;
+        for(let y=0;y<tileH;y++){
+          for(let x=0;x<tileW;x++){
+            let r=0,g=0,b=0,a=0;
+            const base = (y*sW*SS + x*SS)*4;
+            for(let j=0;j<SS;j++){
+              let idx=base + j*sW*4;
+              for(let i=0;i<SS;i++,idx+=4){
+                r+=srcF32[idx]; g+=srcF32[idx+1]; b+=srcF32[idx+2]; a+=srcF32[idx+3];
+              }
+            }
+            r/=area; g/=area; b/=area; a/=area; const o=(y*tileW+x)*4;
+            const A=Math.min(1,a);
+            out[o  ]=A>1e-6? Math.round((r/A)*255):0;
+            out[o+1]=A>1e-6? Math.round((g/A)*255):0;
+            out[o+2]=A>1e-6? Math.round((b/A)*255):0;
+            out[o+3]=Math.round(A*255);
+          }
+        }
+        return out;
+      }
+
+      self.onmessage=(e)=>{
+        const msg=e.data; if(msg.cmd!=='renderTiles') return;
+        const { tileSize, canvasW, canvasH, tilesX, tileIndices, offsets, counts, tileShapeIndex, shapes, SS } = msg;
+        const results=[];
+        for(const t of tileIndices){
+          const tx=t%tilesX, ty=(t/tilesX)|0;
+          const tileX=tx*tileSize, tileY=ty*tileSize;
+          const tileW=Math.min(tileSize, canvasW-tileX), tileH=Math.min(tileSize, canvasH-tileY);
+          const fbuf=new Float32Array((tileW*SS)*(tileH*SS)*4);
+          const start=offsets[t]>>>0, cnt=counts[t]>>>0;
+          for(let i=0;i<cnt;i++){
+            const sIdx=tileShapeIndex[start+i]>>>0; const sh=shapes[sIdx];
+            fillPolygonTile(tileX,tileY,tileW,tileH, sh.verts, sh.color, sh.rule, fbuf, SS);
+          }
+          const pixels=downsampleSSAA(fbuf,tileW,tileH,SS);
+          results.push({ t, tx, ty, tileX, tileY, tileW, tileH, pixels });
+        }
+        self.postMessage({ kind:'tilesDone', results }, results.map(r=>r.pixels.buffer));
+      };
+    };
+    const src=`(${workerFn.toString()})()`;
+    const blob=new Blob([src],{type:'text/javascript'});
+    return URL.createObjectURL(blob);
+  }
+
+  // ---------- Orchestrate ----------
+  async function draw(){
+    const tileSize=Number(tileInp.value);
+    const nWorkers=Number(workersInp.value);
+    const SS=Number(aaSel.value)|0;
+    const [W,H]=[cv.width,cv.height];
+
+    const t0=performance.now();
+    const shapes=await buildShapesFromCode(codeEl.value);
+    const shapesSafe = (shapes && shapes.length>0) ? shapes : (function(){
+      // fallback scene (star + random stroke)
+      const s=star(W*0.5,H*0.45,Math.min(W,H)*0.26,Math.min(W,H)*0.11,7);
+      const arr=[{ verts: Float32Array.from(s.flat()), color: Uint8ClampedArray.from([88,156,255,220]), rule: fillRule }];
+      for (const p of strokeToPolys(randomizeLines(), Number(strokeInp.value),
+            { join:joinSel.value, cap:capSel.value, miterLimit:Number(miterInp.value) }))
+        arr.push({ verts:p, color: Uint8ClampedArray.from([250,245,140,255]), rule:'evenodd' });
+      return arr;
+    })();
+
+    const {tilesX,tilesY,tileCount,counts,offsets,tileShapeIndex}=binShapesIntoTiles(shapesSafe,tileSize);
+    const t1=performance.now();
+
+    const tileIds=new Uint32Array(tileCount); for(let i=0;i<tileCount;i++) tileIds[i]=i;
+    const buckets=Array.from({length:nWorkers},()=>[]);
+    for(let i=0;i<tileCount;i++) buckets[i%nWorkers].push(tileIds[i]);
+
+    const workerURL=makeWorkerURL();
+    const workers=Array.from({length:nWorkers},()=>new Worker(workerURL));
+    const jobs=buckets.map((tileIndices,wi)=>new Promise(resolve=>{
+      const w=workers[wi];
+      w.onmessage=(e)=>{ if(e.data&&e.data.kind==='tilesDone') resolve(e.data.results); };
+      w.postMessage({ cmd:'renderTiles', tileSize, canvasW:W, canvasH:H, tilesX, tileIndices, offsets, counts, tileShapeIndex, shapes:shapesSafe, SS });
+    }));
+
+    const resultSets=await Promise.all(jobs);
+    for(const w of workers) w.terminate();
+    URL.revokeObjectURL(workerURL);
+
+    const t2=performance.now();
+    ctx.clearRect(0,0,W,H);
+    for(const results of resultSets){
+      for(const r of results){
+        const img=new ImageData(r.pixels, r.tileW, r.tileH);
+        ctx.putImageData(img, r.tileX, r.tileY);
+      }
+    }
+    const t3=performance.now();
+
+    tBuild.textContent=(t1-t0).toFixed(2)+' ms';
+    tRaster.textContent=(t3-t1).toFixed(2)+' ms';
+    tTiles.textContent=`${tilesX}×${Math.ceil(H/tileSize)} = ${tilesX*Math.ceil(H/tileSize)}`;
+  }
+
+  // Initial state
+  randomizeLines();
+  draw();
+})();
+</script>
+</body>
+</html>
